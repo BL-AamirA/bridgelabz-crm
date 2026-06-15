@@ -126,7 +126,11 @@ export default function Home() {
           ) : (
             <div className="flex flex-col gap-3">
               {accounts.map((acc) => (
-                <div key={acc.id} className="border p-4 rounded flex justify-between items-center">
+                <div 
+                  key={acc.id} 
+                  className="border p-4 rounded flex justify-between items-center cursor-pointer hover:bg-gray-50 transition"
+                  onClick={() => router.push(`/accounts/${acc.id}`)}
+                >
                   <div>
                     <h3 className="font-bold">{acc.name}</h3>
                     <p className="text-sm text-gray-500">{acc.city || "No city"}</p>
