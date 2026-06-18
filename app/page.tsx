@@ -16,12 +16,18 @@ export default function Home() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [userName, setUserName] = useState("");
   const [userRole, setUserRole] = useState("");
+  
+  // Form State
   const [name, setName] = useState("");
   const [type, setType] = useState("GCC");
   const [city, setCity] = useState("");
+  
+  // Filter State
+  const [filterStage, setFilterStage] = useState("All");
+  const [filterCity, setFilterCity] = useState("");
+  
   const router = useRouter();
 
-  // Fetch user data and accounts
   const fetchData = async () => {
     const supabase = createClient();
     
@@ -31,7 +37,6 @@ export default function Home() {
       return;
     }
 
-    // Get user's name AND role
     const { data: userData } = await supabase
       .from("users")
       .select("name, role")
@@ -43,7 +48,6 @@ export default function Home() {
       setUserRole(userData.role);
     }
 
-    // Get accounts (RLS automatically applies!)
     const { data: accountData } = await supabase
       .from("accounts")
       .select("*")
@@ -65,15 +69,18 @@ export default function Home() {
   const handleAddAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     const supabase = createClient();
-
-    await supabase.from("accounts").insert([
-      { name, type, city, stage: "Cold" }
-    ]);
-
+    await supabase.from("accounts").insert([{ name, type, city, stage: "Cold" }]);
     setName("");
     setCity("");
     fetchData();
   };
+
+  // Filter logic: only show accounts that match the selected stage and city search
+  const filteredAccounts = accounts.filter((acc) => {
+    const matchesStage = filterStage === "All" || acc.stage === filterStage;
+    const matchesCity = filterCity === "" || (acc.city && acc.city.toLowerCase().includes(filterCity.toLowerCase()));
+    return matchesStage && matchesCity;
+  });
 
   return (
     <main className="min-h-screen p-10 bg-gray-50">
@@ -81,9 +88,7 @@ export default function Home() {
         <h1 className="text-3xl font-bold text-[#091C2B]">BridgeLabz CRM</h1>
         <div className="flex items-center gap-4">
           <span className="text-gray-600">Welcome, {userName} ({userRole})</span>
-          <button onClick={handleLogout} className="text-red-500 hover:underline text-sm">
-            Log Out
-          </button>
+          <button onClick={handleLogout} className="text-red-500 hover:underline text-sm">Log Out</button>
         </div>
       </div>
 
@@ -94,48 +99,44 @@ export default function Home() {
           <div className="bg-white p-6 rounded-lg shadow-md border border-gray-200 h-fit">
             <h2 className="text-xl font-semibold mb-4 text-[#D26A3E]">Add New Account</h2>
             <form onSubmit={handleAddAccount} className="flex flex-col gap-4">
-              <input
-                type="text"
-                placeholder="Company Name (e.g. Kyndryl)"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="border p-2 rounded"
-                required
-              />
+              <input type="text" placeholder="Company Name (e.g. Kyndryl)" value={name} onChange={(e) => setName(e.target.value)} className="border p-2 rounded" required />
               <select value={type} onChange={(e) => setType(e.target.value)} className="border p-2 rounded">
                 <option value="GCC">GCC</option>
                 <option value="SI">SI</option>
                 <option value="Academic">Academic</option>
                 <option value="Investor">Investor</option>
               </select>
-              <input
-                type="text"
-                placeholder="City (e.g. Bangalore)"
-                value={city}
-                onChange={(e) => setCity(e.target.value)}
-                className="border p-2 rounded"
-              />
-              <button type="submit" className="bg-[#091C2B] text-white p-2 rounded hover:bg-[#D26A3E] transition">
-                Add Account
-              </button>
+              <input type="text" placeholder="City (e.g. Bangalore)" value={city} onChange={(e) => setCity(e.target.value)} className="border p-2 rounded" />
+              <button type="submit" className="bg-[#091C2B] text-white p-2 rounded hover:bg-[#D26A3E] transition">Add Account</button>
             </form>
           </div>
         )}
 
-        {/* RIGHT COLUMN: Account List */}
+        {/* RIGHT COLUMN: Account List with Filters */}
         <div className={userRole === "CEO" ? "col-span-2" : "col-span-3"}>
           <div className="bg-white p-6 rounded-lg shadow-md border border-gray-200">
+            
+            {/* FILTER BAR */}
+            <div className="flex gap-4 mb-6 pb-4 border-b">
+              <select value={filterStage} onChange={(e) => setFilterStage(e.target.value)} className="border p-2 rounded">
+                <option value="All">All Stages</option>
+                <option value="Cold">Cold</option>
+                <option value="Warm">Warm</option>
+                <option value="Hot">Hot</option>
+                <option value="Closed Won">Closed Won</option>
+                <option value="Closed Lost">Closed Lost</option>
+                <option value="On Hold">On Hold</option>
+              </select>
+              <input type="text" placeholder="Filter by City..." value={filterCity} onChange={(e) => setFilterCity(e.target.value)} className="border p-2 rounded flex-grow" />
+            </div>
+
             <h2 className="text-xl font-semibold mb-4 text-[#091C2B]">Pipeline Accounts</h2>
-            {accounts.length === 0 ? (
-              <p className="text-gray-500">No accounts found for your role.</p>
+            {filteredAccounts.length === 0 ? (
+              <p className="text-gray-500">No accounts match your filters.</p>
             ) : (
               <div className="flex flex-col gap-3">
-                {accounts.map((acc) => (
-                  <div 
-                    key={acc.id} 
-                    className="border p-4 rounded flex justify-between items-center cursor-pointer hover:bg-gray-50 transition"
-                    onClick={() => router.push(`/accounts/${acc.id}`)}
-                  >
+                {filteredAccounts.map((acc) => (
+                  <div key={acc.id} className="border p-4 rounded flex justify-between items-center cursor-pointer hover:bg-gray-50 transition" onClick={() => router.push(`/accounts/${acc.id}`)}>
                     <div>
                       <h3 className="font-bold">{acc.name}</h3>
                       <p className="text-sm text-gray-500">{acc.city || "No city"}</p>
