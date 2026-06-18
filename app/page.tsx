@@ -10,10 +10,17 @@ type Account = {
   type: string | null;
   stage: string | null;
   city: string | null;
+  spoc_id: string | null;
+};
+
+type User = {
+  id: string;
+  name: string;
 };
 
 export default function Home() {
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [users, setUsers] = useState<User[]>([]); // To populate SPOC filter
   const [userName, setUserName] = useState("");
   const [userRole, setUserRole] = useState("");
   
@@ -25,6 +32,8 @@ export default function Home() {
   // Filter State
   const [filterStage, setFilterStage] = useState("All");
   const [filterCity, setFilterCity] = useState("");
+  const [filterType, setFilterType] = useState("All");
+  const [filterSpoc, setFilterSpoc] = useState("All");
   
   const router = useRouter();
 
@@ -47,6 +56,10 @@ export default function Home() {
       setUserName(userData.name);
       setUserRole(userData.role);
     }
+
+    // Fetch all users so CEO can filter by SPOC
+    const { data: usersData } = await supabase.from("users").select("id, name");
+    if (usersData) setUsers(usersData);
 
     const { data: accountData } = await supabase
       .from("accounts")
@@ -75,11 +88,13 @@ export default function Home() {
     fetchData();
   };
 
-  // Filter logic: only show accounts that match the selected stage and city search
+  // Filter logic: match all 4 filters
   const filteredAccounts = accounts.filter((acc) => {
     const matchesStage = filterStage === "All" || acc.stage === filterStage;
     const matchesCity = filterCity === "" || (acc.city && acc.city.toLowerCase().includes(filterCity.toLowerCase()));
-    return matchesStage && matchesCity;
+    const matchesType = filterType === "All" || acc.type === filterType;
+    const matchesSpoc = filterSpoc === "All" || acc.spoc_id === filterSpoc;
+    return matchesStage && matchesCity && matchesType && matchesSpoc;
   });
 
   return (
@@ -116,8 +131,8 @@ export default function Home() {
         <div className={userRole === "CEO" ? "col-span-2" : "col-span-3"}>
           <div className="bg-white p-6 rounded-lg shadow-md border border-gray-200">
             
-            {/* FILTER BAR */}
-            <div className="flex gap-4 mb-6 pb-4 border-b">
+            {/* FILTER BAR - 4 FILTERS */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 pb-4 border-b">
               <select value={filterStage} onChange={(e) => setFilterStage(e.target.value)} className="border p-2 rounded">
                 <option value="All">All Stages</option>
                 <option value="Cold">Cold</option>
@@ -127,7 +142,21 @@ export default function Home() {
                 <option value="Closed Lost">Closed Lost</option>
                 <option value="On Hold">On Hold</option>
               </select>
-              <input type="text" placeholder="Filter by City..." value={filterCity} onChange={(e) => setFilterCity(e.target.value)} className="border p-2 rounded flex-grow" />
+              <input type="text" placeholder="Filter by City..." value={filterCity} onChange={(e) => setFilterCity(e.target.value)} className="border p-2 rounded" />
+              <select value={filterType} onChange={(e) => setFilterType(e.target.value)} className="border p-2 rounded">
+                <option value="All">All Types</option>
+                <option value="GCC">GCC</option>
+                <option value="SI">SI</option>
+                <option value="Academic">Academic</option>
+                <option value="Investor">Investor</option>
+                <option value="Product">Product</option>
+              </select>
+              <select value={filterSpoc} onChange={(e) => setFilterSpoc(e.target.value)} className="border p-2 rounded">
+                <option value="All">All SPOCs</option>
+                {users.map((u) => (
+                  <option key={u.id} value={u.id}>{u.name}</option>
+                ))}
+              </select>
             </div>
 
             <h2 className="text-xl font-semibold mb-4 text-[#091C2B]">Pipeline Accounts</h2>
