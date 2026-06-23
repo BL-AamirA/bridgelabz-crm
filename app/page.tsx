@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
+import { BridgiLogo } from "@/components/BridgiLogo";
 
 type Account = {
   id: string;
@@ -100,8 +101,17 @@ export default function Home() {
   return (
     <main className="min-h-screen p-10 bg-gray-50">
       <div className="flex justify-between items-center mb-8">
+      <div className="flex items-center gap-6">
         <h1 className="text-3xl font-bold text-[#091C2B]">BridgeLabz CRM</h1>
-        <div className="flex items-center gap-4">
+        <button 
+          onClick={() => router.push('/chat')} 
+          className="bg-[#D26A3E] text-white px-4 py-2 rounded text-sm font-semibold hover:bg-[#091C2B] transition flex items-center gap-2"
+        >
+          <BridgiLogo size={25} /> 
+          Ask Bridgi AI
+        </button>
+      </div>
+      <div className="flex items-center gap-4">
           <span className="text-gray-600">Welcome, {userName} ({userRole})</span>
           <button onClick={handleLogout} className="text-red-500 hover:underline text-sm">Log Out</button>
         </div>
