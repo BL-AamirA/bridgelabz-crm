@@ -21,9 +21,10 @@ import { BridgiLogo } from "@/components/BridgiLogo";
 
 export default function Chat() {
   const router = useRouter();
-  const { messages, sendMessage, status } = useChat({
-    api: '/api/chat'
-  });
+  // const { messages, sendMessage, status } = useChat({
+  //   api: '/api/chat'
+  // });
+  const { messages, sendMessage, status } = useChat();
   
   const [input, setInput] = useState("");
   const isLoading = status === 'submitted' || status === 'streaming';
