@@ -5,25 +5,8 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { BridgiLogo } from "@/components/BridgiLogo";
 
-// // Custom Logo matching the BridgeLabz colorful abstract theme
-// function BridgiLogo({ size = 32 }: { size?: number }) {
-//   return (
-//     <svg width={size} height={size} viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
-//       <circle cx="20" cy="20" r="20" fill="#F3F4F6" />
-//       <circle cx="20" cy="14" r="5" fill="#D26A3E" />
-//          <path d="M9 34C9 27.268 13.925 22 20 22C26.075 22 31 27.268 31 34" fill="none" stroke="#1D4ED8" strokeWidth="3" strokeLinecap="round" />
-//       <path d="M20 25.5C15 25.5 12 28 12 35H20V25.5Z" fill="#EAB308" />
-//       <path d="M20 25.5C25 25.5 28 28 28 35H20V25.5Z" fill="#16A34A" />
-
-//     </svg>
-//   );
-// }
-
 export default function Chat() {
   const router = useRouter();
-  // const { messages, sendMessage, status } = useChat({
-  //   api: '/api/chat'
-  // });
   const { messages, sendMessage, status } = useChat();
   
   const [input, setInput] = useState("");
@@ -68,9 +51,140 @@ export default function Chat() {
                   </span>
                   <div className="whitespace-pre-wrap">
                     {m.parts.map((part, i) => {
+                      // 1. Render standard text
                       if (part.type === 'text') {
                         return <div key={i}>{part.text}</div>;
                       }
+                      
+                      // 2. Ignore step-starts
+                      if (part.type === 'step-start') {
+                        return null;
+                      }
+
+                      // 3. Handle Tool Calls
+                      if (typeof part.type === 'string' && part.type.startsWith('tool-')) {
+                        const toolPart = part as any;
+                        
+                        // If the tool is currently running
+                        if (toolPart.state === 'input-streaming' || toolPart.state === 'input-available') {
+                          return (
+                            <div key={i} className="text-sm text-gray-400 animate-pulse mb-1">
+                              🔍 Processing...
+                            </div>
+                          );
+                        }
+                        
+                        // If the tool finished
+                        if (toolPart.state === 'output-available') {
+                          const data = toolPart.output;
+                          const toolName = part.type; 
+
+                          // ==========================================
+                          // RENDER WRITE CONFIRMATION (Meeting Notes)
+                          // ==========================================
+                                                    
+                          if (toolName === 'tool-captureMeetingNotes') {
+                            if (data.success) {
+                              return (
+                                <div key={i} className="mt-2 bg-green-50 border border-green-200 text-green-800 p-3 rounded text-sm flex items-start gap-2">
+                                  <span className="text-lg">✅</span>
+                                  <div>
+                                    <div className="font-bold">Saved to CRM!</div>
+                                    <div>{data.message}</div>
+                                  </div>
+                                </div>
+                              );
+                            } else {
+                              // DEBUG: Show exactly what the tool returned if it failed
+                              return <div key={i} className="text-red-500 text-sm mt-1 bg-red-50 p-2 rounded border border-red-200">{JSON.stringify(data)}</div>;
+                            }
+                          }
+
+                          // ==========================================
+                          // RENDER READ DATA (Account Info with Keyword Fallback)
+                          // ==========================================
+                          const lastUserMessage = messages.filter(m => m.role === 'user').pop();
+                          const userText = lastUserMessage?.parts?.map((p: any) => p.text).join(' ').toLowerCase() || '';
+
+                          let uiFocus = toolPart.input?.focus || 'full'; 
+
+                          // Override focus based on user keywords
+                          if (userText.includes('action item') || userText.includes('task') || userText.includes('todo') || userText.includes('follow up')) {
+                            uiFocus = 'action_items';
+                          } else if (userText.includes('contact') || userText.includes('person') || userText.includes('who')) {
+                            uiFocus = 'contacts';
+                          } else if (userText.includes('interaction') || userText.includes('meeting') || userText.includes('history')) {
+                            uiFocus = 'interactions';
+                          }
+
+                          if (data.found === false) {
+                            return <div key={i} className="text-red-500 text-sm mt-1">{data.message}</div>;
+                          }
+
+                          return (
+                            <div key={i} className="mt-2 text-sm space-y-3 bg-gray-50 p-3 rounded border border-gray-100">
+                              <div className="font-bold text-[#091C2B] text-base">
+                                {data.account.name} 
+                                <span className="font-normal text-gray-500 text-xs ml-2">
+                                  {data.account.type} | {data.account.stage} | {data.account.city}
+                                </span>
+                              </div>
+                              
+                              {(uiFocus === 'full' || uiFocus === 'contacts') && data.contacts?.length > 0 && (
+                                <div>
+                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Contacts</div>
+                                  <ul className="mt-1 space-y-1">
+                                    {data.contacts.map((c: any, idx: number) => (
+                                      <li key={idx} className="text-gray-800">
+                                        {c.name} <span className="text-gray-500 text-xs">({c.title})</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {(uiFocus === 'contacts' && (!data.contacts || data.contacts.length === 0)) && (
+                                 <div className="text-gray-500 italic">No contacts found for {data.account.name}.</div>
+                              )}
+
+                              {(uiFocus === 'full' || uiFocus === 'interactions') && data.interactions?.length > 0 && (
+                                <div>
+                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Recent Interactions</div>
+                                  <ul className="mt-1 space-y-1">
+                                    {data.interactions.map((int: any, idx: number) => (
+                                      <li key={idx} className="text-gray-800">
+                                        <span className="text-gray-500 text-xs">({int.date})</span> {int.notes}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {(uiFocus === 'interactions' && (!data.interactions || data.interactions.length === 0)) && (
+                                 <div className="text-gray-500 italic">No recent interactions found for {data.account.name}.</div>
+                              )}
+
+                              {(uiFocus === 'full' || uiFocus === 'action_items') && data.actionItems?.length > 0 && (
+                                <div>
+                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Action Items</div>
+                                  <ul className="mt-1 space-y-1">
+                                    {data.actionItems.map((a: any, idx: number) => (
+                                      <li key={idx} className="text-gray-800">
+                                        <span className="font-mono bg-gray-200 text-gray-700 px-1.5 py-0.5 rounded text-xs mr-1">{a.priority}</span>
+                                        {a.description} 
+                                        <span className="text-gray-500 text-xs ml-1">(Status: {a.status}, Due: {a.due_date || 'N/A'})</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              {(uiFocus === 'action_items' && (!data.actionItems || data.actionItems.length === 0)) && (
+                                 <div className="text-gray-500 italic">No pending action items for {data.account.name}.</div>
+                              )}
+                            </div>
+                          );
+                        }
+                      }
+                      
                       return null;
                     })}
                   </div>
@@ -80,7 +194,6 @@ export default function Chat() {
             {isLoading && messages.at(-1)?.role === 'user' && (
               <div className="flex justify-start">
                 <div className="flex items-center gap-2 bg-gray-100 p-4 rounded-2xl rounded-tl-none border border-gray-200 shadow-sm">
-                  {/* Three bouncing figures like your logo */}
                   <div className="flex items-end gap-1 h-8">
                     <div className="w-2 h-2 bg-[#F97316] rounded-full animate-bounce [animation-delay:-0.3s]"></div>
                     <div className="w-2 h-2 bg-[#3B82F6] rounded-full animate-bounce [animation-delay:-0.15s]"></div>
