@@ -41,7 +41,7 @@ export default function Chat() {
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            {messages.map((m) => (
+            {messages.map((m, messageIndex) => (
               <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {/* AI Bubble */}
                 {m.role !== 'user' && <div className="mr-2 mt-1"><BridgiLogo size={32} /></div>}
@@ -82,7 +82,6 @@ export default function Chat() {
                           // ==========================================
                           // RENDER WRITE CONFIRMATION (Meeting Notes)
                           // ==========================================
-                                                    
                           if (toolName === 'tool-captureMeetingNotes') {
                             if (data.success) {
                               return (
@@ -95,25 +94,32 @@ export default function Chat() {
                                 </div>
                               );
                             } else {
-                              // DEBUG: Show exactly what the tool returned if it failed
                               return <div key={i} className="text-red-500 text-sm mt-1 bg-red-50 p-2 rounded border border-red-200">{JSON.stringify(data)}</div>;
                             }
                           }
 
                           // ==========================================
-                          // RENDER READ DATA (Account Info with Keyword Fallback)
+                          // RENDER READ DATA (Account Info)
                           // ==========================================
-                          const lastUserMessage = messages.filter(m => m.role === 'user').pop();
-                          const userText = lastUserMessage?.parts?.map((p: any) => p.text).join(' ').toLowerCase() || '';
+                          
+                          // FIX: Find the user message that immediately precedes THIS AI message
+                          // This prevents old cards from mutating when a new question is asked!
+                          let triggeringUserText = '';
+                          if (messageIndex > 0 && messages[messageIndex - 1].role === 'user') {
+                            triggeringUserText = messages[messageIndex - 1].parts
+                              ?.map((p: any) => p.text)
+                              .join(' ')
+                              .toLowerCase() || '';
+                          }
 
                           let uiFocus = toolPart.input?.focus || 'full'; 
 
-                          // Override focus based on user keywords
-                          if (userText.includes('action item') || userText.includes('task') || userText.includes('todo') || userText.includes('follow up')) {
+                          // Override focus based on the specific user question that triggered this card
+                          if (triggeringUserText.includes('action item') || triggeringUserText.includes('task') || triggeringUserText.includes('todo') || triggeringUserText.includes('follow up')) {
                             uiFocus = 'action_items';
-                          } else if (userText.includes('contact') || userText.includes('person') || userText.includes('who')) {
+                          } else if (triggeringUserText.includes('contact') || triggeringUserText.includes('person') || triggeringUserText.includes('who')) {
                             uiFocus = 'contacts';
-                          } else if (userText.includes('interaction') || userText.includes('meeting') || userText.includes('history')) {
+                          } else if (triggeringUserText.includes('interaction') || triggeringUserText.includes('meeting') || triggeringUserText.includes('history')) {
                             uiFocus = 'interactions';
                           }
 
@@ -130,13 +136,14 @@ export default function Chat() {
                                 </span>
                               </div>
                               
+                              {/* Contacts */}
                               {(uiFocus === 'full' || uiFocus === 'contacts') && data.contacts?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Contacts</div>
                                   <ul className="mt-1 space-y-1">
                                     {data.contacts.map((c: any, idx: number) => (
                                       <li key={idx} className="text-gray-800">
-                                        {c.name} <span className="text-gray-500 text-xs">({c.title})</span>
+                                        {c.name} {c.title && <span className="text-gray-500 text-xs">({c.title})</span>}
                                       </li>
                                     ))}
                                   </ul>
@@ -146,6 +153,7 @@ export default function Chat() {
                                  <div className="text-gray-500 italic">No contacts found for {data.account.name}.</div>
                               )}
 
+                              {/* Interactions */}
                               {(uiFocus === 'full' || uiFocus === 'interactions') && data.interactions?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Recent Interactions</div>
@@ -162,21 +170,19 @@ export default function Chat() {
                                  <div className="text-gray-500 italic">No recent interactions found for {data.account.name}.</div>
                               )}
 
+                              {/* Action Items */}
                               {(uiFocus === 'full' || uiFocus === 'action_items') && data.actionItems?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Action Items</div>
                                   <ul className="mt-1 space-y-1">
                                     {data.actionItems.map((a: any, idx: number) => (
                                       <li key={idx} className="text-gray-800">
-                                        <span className="font-mono bg-gray-200 text-gray-700 px-1.5 py-0.5 rounded text-xs mr-1">{a.priority}</span>
-                                        {a.description} 
-                                        <span className="text-gray-500 text-xs ml-1">(Status: {a.status}, Due: {a.due_date || 'N/A'})</span>
+                                        {a.priority} {a.description} <span className="text-gray-500 text-xs">(Status: {a.status}, Due: {a.due_date})</span>
                                       </li>
                                     ))}
                                   </ul>
                                 </div>
                               )}
-
                               {(uiFocus === 'action_items' && (!data.actionItems || data.actionItems.length === 0)) && (
                                  <div className="text-gray-500 italic">No pending action items for {data.account.name}.</div>
                               )}
