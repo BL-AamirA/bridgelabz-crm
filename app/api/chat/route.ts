@@ -102,7 +102,8 @@ export async function POST(req: Request) {
 
       const { data: contacts } = await supabase.from('contacts').select('name, title, email').eq('account_id', account.id);
       const { data: interactions } = await supabase.from('interactions').select('type, notes, date').eq('account_id', account.id).order('date', { ascending: false }).limit(3);
-      const { data: actionItems } = await supabase.from('action_items').select('description, priority, due_date, status').eq('account_id', account.id).order('due_date', { ascending: true });
+      // Filter out blank interactions so the AI doesn't see them
+      const cleanInteractions = (interactions || []).filter((int: any) => int.notes && int.notes.trim() !== '');      const { data: actionItems } = await supabase.from('action_items').select('description, priority, due_date, status').eq('account_id', account.id).order('due_date', { ascending: true });
       
       // ==========================================
       // SEMANTIC SEARCH (Vector Search)
@@ -126,13 +127,13 @@ export async function POST(req: Request) {
       const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp)\b/i;
       const cleanContacts = (contacts || []).filter((c: any) => !garbageWords.test(c.name));
 
-      return {
+        return {
         found: true,
         account: { name: account.name, type: account.type, stage: account.stage, city: account.city },
         contacts: cleanContacts,
-        interactions: interactions || [],
+        interactions: cleanInteractions, 
         actionItems: actionItems || [],
-        semanticMatches: semanticMatches // NEW: Passing vector matches to AI!
+        semanticMatches: semanticMatches 
       };
     },
   };
@@ -164,25 +165,39 @@ export async function POST(req: Request) {
       let finalCompanyName = companyName;
       let finalContacts: any[] = contacts || [];
       let finalActionItems: any[] = actionItems || [];
-      let finalInteractionNotes = interactionNotes; // NEW: Create a mutable variable for notes
+      let finalInteractionNotes = interactionNotes; 
 
       // Extract user message ONCE at the top for all fallbacks
       const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
 
       // ==========================================
-      // GARBAGE FILTER: Clean up hallucinated names immediately!
+      // CLEAN COMPANY NAME FIRST! (Crucial for contact filter)
       // ==========================================
-      const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp)\b/i;
-      finalContacts = finalContacts.filter(c => !garbageWords.test(c.name));
-
-      // NEW: Clean up any leading prepositions the AI might have accidentally included
       if (finalCompanyName) {
         finalCompanyName = finalCompanyName.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim();
       }
+
+      // ==========================================
+      // GARBAGE FILTER & COMPANY FILTER (NUCLEAR OPTION)
+      // ==========================================
+      const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp|met|with|about|for|of)\b/i;
       
-      // NEW: If the AI put the company name in the contacts list, remove it!
-      if (finalCompanyName && finalContacts.length > 0) {
-        finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
+      // 1. Filter garbage words
+      finalContacts = finalContacts.filter(c => !garbageWords.test(c.name));
+
+      // 2. Strip leading prepositions (e.g. "with Kyndryl" -> "Kyndryl")
+      finalContacts = finalContacts.map(c => ({
+        ...c,
+        name: c.name.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim()
+      }));
+
+      // 3. NUCLEAR: If the contact name matches the company name (exactly or contains it), REMOVE IT.
+      if (finalCompanyName && finalCompanyName.trim() !== '') {
+        finalContacts = finalContacts.filter(c => {
+          const contactLower = c.name.toLowerCase();
+          const companyLower = finalCompanyName.toLowerCase();
+          return contactLower !== companyLower && !contactLower.includes(companyLower);
+        });
       }
 
       // NEW: If the AI forgot the interaction notes, use the user's original message!
@@ -191,10 +206,10 @@ export async function POST(req: Request) {
         finalInteractionNotes = lastUserMessage; 
       }
 
-      if (!finalCompanyName || finalCompanyName.trim() === '') {
-        console.log("[Write Fallback] AI didn't extract the company name. Extracting manually...");
-        
-        const match = lastUserMessage.match(/\b(?:met|with|at|visited|of|about|for)\s+([A-Za-z0-9& ]+?)(?:\s+today|\s+yesterday|\s+this week|\.|,|$)/i);
+      // UPGRADED: If AI forgets, or passes lazy text starting with "with" or "met", force proper extraction
+      if (!finalCompanyName || finalCompanyName.trim() === '' || /^(met with|met|with|at|visited|about|for|of)\b/i.test(finalCompanyName)) {
+        console.log("[Write Fallback] AI didn't extract the company name properly. Extracting manually...");
+        const match = lastUserMessage.match(/\b(?:met with|met|at|visited|of|about|for)\s+([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)/i);
         if (match && match[1]) {
           finalCompanyName = match[1].trim();
         } else {
@@ -207,6 +222,11 @@ export async function POST(req: Request) {
         if (contactMatches) {
           let extractedContacts = contactMatches.map((c: string) => ({ name: c.replace(/^(met with|met|attended|joined|was there)\s+/i, '').trim() }));
           finalContacts = extractedContacts.filter((c: { name: string }) => !garbageWords.test(c.name));
+          
+          // NUCLEAR: Filter company name from regex extraction too!
+          if (finalCompanyName) {
+             finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
+          }
         }
       }
 
@@ -276,31 +296,43 @@ export async function POST(req: Request) {
       }
 
       // ==========================================
-      // 2. Create Interaction AND Auto-Embed
+      // 2. Create Interaction AND Auto-Embed (WITH JS DEDUPE)
       // ==========================================
-      const { data: newInteraction } = await supabase
-        .from('interactions')
-        .insert([{
-          account_id: accountId,
-          type: interactionType,
-          notes: finalInteractionNotes, // USE THE FALLBACK NOTES HERE
-        }])
-        .select('id')
-        .single();
+      let newInteraction: any = null;
+      
+            // JS Deduplication: Check if a very similar note already exists (ignoring punctuation & casing)
+      const { data: existingInteractions } = await supabase.from('interactions').select('notes').eq('account_id', accountId);
+      const cleanNewNote = finalInteractionNotes.replace(/[^a-zA-Z0-9 ]/g, '').toLowerCase().replace(/bridgi ai/gi, '').trim();
+      
+      const isDuplicate = existingInteractions?.some((i: any) => {
+        const cleanExistingNote = (i.notes || '').replace(/[^a-zA-Z0-9 ]/g, '').toLowerCase().replace(/bridgi ai/gi, '').trim();
+        return cleanExistingNote === cleanNewNote;
+      });
 
-      // Generate the vector embedding in the background
-      if (newInteraction) {
-        console.log("[Embedding] Generating vector for interaction...");
-        const embedding = await generateEmbedding(finalInteractionNotes); // USE THE FALLBACK NOTES HERE
-        
-        if (embedding) {
-          // Update the row we just created with the embedding vector
-          await supabase
-            .from('interactions')
-            .update({ embedding: embedding })
-            .eq('id', newInteraction.id);
-          console.log("[Embedding] Vector saved to database!");
+      if (!isDuplicate) {
+        const { data } = await supabase
+          .from('interactions')
+          .insert([{
+            account_id: accountId,
+            type: interactionType,
+            notes: finalInteractionNotes,
+          }])
+          .select('id')
+          .single();
+        newInteraction = data;
+
+        // Generate the vector embedding
+        if (newInteraction) {
+          console.log("[Embedding] Generating vector for interaction...");
+          const embedding = await generateEmbedding(finalInteractionNotes);
+          
+          if (embedding) {
+            await supabase.from('interactions').update({ embedding: embedding }).eq('id', newInteraction.id);
+            console.log("[Embedding] Vector saved to database!");
+          }
         }
+      } else {
+        console.log("[Write Dedupe] Interaction already exists. Skipping insert.");
       }
 
       // 3. Create Contacts - WITH DEDUPE & CLEANUP
@@ -357,7 +389,7 @@ export async function POST(req: Request) {
     - If the context contains Action Items, list them clearly with their Priority, Status, and Due Date.
     - NEVER skip the contacts list or action items if they are provided by the tool.
     - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else. Do not add your own summary or mention names that the tool did not confirm.
-    - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.
+    // - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.
     - SEMANTIC SEARCH: If the context includes "semanticMatches", these are past meeting notes found via semantic similarity (meaning-based search). Prioritize them to answer specific questions about what was discussed in the past, even if the exact keywords aren't in the user's question.`,
     
     messages: coreMessages,
@@ -366,6 +398,7 @@ export async function POST(req: Request) {
       captureMeetingNotes: captureMeetingNotesTool as any,
     },
     toolChoice,
+    // maxSteps: 5,
   });
 
   return result.toUIMessageStreamResponse();
