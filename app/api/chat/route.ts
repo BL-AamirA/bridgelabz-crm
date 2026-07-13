@@ -1,4 +1,5 @@
 import { google } from '@ai-sdk/google';
+import { generateEmbedding } from '@/lib/embeddings';
 import { streamText } from 'ai';
 import { z } from 'zod';
 import { createServerClientInstance } from '@/lib/supabase-server';
@@ -14,6 +15,7 @@ type ReadToolResult = {
   contacts?: any[];
   interactions?: any[];
   actionItems?: any[];
+  semanticMatches?: any[]; // NEW: for vector search results
 };
 
 type WriteToolResult = {
@@ -78,16 +80,17 @@ export async function POST(req: Request) {
         let lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
         lastUserMessage = lastUserMessage.replace(/"/g, '');
         
-        // UPGRADED: Added "of|about|for" to catch "action items OF Google"
-        const match = lastUserMessage.match(/\b(?:for|about|of|at|with)\s+([A-Za-z0-9& ]+?)(?:\?|\.|!|"|$)/i);
+        let match = lastUserMessage.match(/\b(?:at|for|of|with|about)\s+([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)/);
         if (match && match[1]) {
-          let rawExtraction = match[1].trim();
-          const crmKeywords = /\b(contacts|action items|tasks|status|details|history|interactions|the|of|for|at|with|are|is)\b/gi;
-          let cleanName = rawExtraction.replace(crmKeywords, '').trim();
-          cleanName = cleanName.replace(/\s{2,}/g, ' ').trim();
-          companyName = cleanName.length > 0 ? cleanName : rawExtraction;
+          companyName = match[1].trim();
         } else {
-          return { error: "No company name was provided. Please ask the user which company they are referring to." };
+          // Fallback 2: Just grab the last capitalized word before the question mark (e.g., "status of Kyndryl?")
+          const lastWordMatch = lastUserMessage.match(/([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)\s*\?/);
+          if (lastWordMatch && lastWordMatch[1]) {
+            companyName = lastWordMatch[1].trim();
+          } else {
+            return { error: "No company name was provided. Please ask the user which company they are referring to." };
+          }
         }
       }
 
@@ -101,6 +104,24 @@ export async function POST(req: Request) {
       const { data: interactions } = await supabase.from('interactions').select('type, notes, date').eq('account_id', account.id).order('date', { ascending: false }).limit(3);
       const { data: actionItems } = await supabase.from('action_items').select('description, priority, due_date, status').eq('account_id', account.id).order('due_date', { ascending: true });
       
+      // ==========================================
+      // SEMANTIC SEARCH (Vector Search)
+      // ==========================================
+      let semanticMatches: any[] = [];
+      console.log("[Semantic Search] Embedding user query...");
+      const queryEmbedding = await generateEmbedding(lastUserMessage);
+      
+      if (queryEmbedding) {
+        console.log("[Semantic Search] Querying pgvector for matches...");
+        const { data: matches } = await supabase.rpc('match_interactions', {
+          query_embedding: queryEmbedding,
+          match_account_id: account.id,
+          match_count: 3
+        });
+        semanticMatches = matches || [];
+        console.log(`[Semantic Search] Found ${semanticMatches.length} semantic matches!`);
+      }
+
       // Filter out garbage names from existing DB data just in case
       const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp)\b/i;
       const cleanContacts = (contacts || []).filter((c: any) => !garbageWords.test(c.name));
@@ -110,7 +131,8 @@ export async function POST(req: Request) {
         account: { name: account.name, type: account.type, stage: account.stage, city: account.city },
         contacts: cleanContacts,
         interactions: interactions || [],
-        actionItems: actionItems || []
+        actionItems: actionItems || [],
+        semanticMatches: semanticMatches // NEW: Passing vector matches to AI!
       };
     },
   };
@@ -118,9 +140,9 @@ export async function POST(req: Request) {
   const captureMeetingNotesTool = {
     description: 'Saves meeting notes and interactions to the CRM database. Use this ONLY when the user provides NEW information or describes a past event. Trigger words: "Met", "Attended", "Discussed", "Follow up", "Had a meeting". Do NOT use this if the user is just asking a question.',
     parameters: z.object({
-      companyName: z.string().describe('The name of the company discussed.'),
+      companyName: z.string().describe('The name of the company discussed. JUST the proper noun, e.g., "Kyndryl". NEVER include words like "with", "at", "met", or "visited" in this string.'),
       interactionType: z.string().describe('The type of interaction. Possible values: "meeting", "email", "whatsapp", "linkedin".'),
-      interactionNotes: z.string().describe('A brief summary of what was discussed.'),
+      interactionNotes: z.string().describe('A detailed summary of EVERYTHING discussed in the meeting. Never leave this blank. If the user says "Discussed regulatory compliance", write "Discussed regulatory compliance".'),
       contacts: z.array(z.object({
         name: z.string().describe('The FIRST and LAST name of a HUMAN PERSON. Do NOT put event descriptions, companies, or sentences here. Only proper names like "Sunder Pichai".'),
         title: z.string().optional().describe('Job title of the person, if mentioned.'),
@@ -142,6 +164,10 @@ export async function POST(req: Request) {
       let finalCompanyName = companyName;
       let finalContacts: any[] = contacts || [];
       let finalActionItems: any[] = actionItems || [];
+      let finalInteractionNotes = interactionNotes; // NEW: Create a mutable variable for notes
+
+      // Extract user message ONCE at the top for all fallbacks
+      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
 
       // ==========================================
       // GARBAGE FILTER: Clean up hallucinated names immediately!
@@ -149,11 +175,25 @@ export async function POST(req: Request) {
       const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp)\b/i;
       finalContacts = finalContacts.filter(c => !garbageWords.test(c.name));
 
+      // NEW: Clean up any leading prepositions the AI might have accidentally included
+      if (finalCompanyName) {
+        finalCompanyName = finalCompanyName.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim();
+      }
+      
+      // NEW: If the AI put the company name in the contacts list, remove it!
+      if (finalCompanyName && finalContacts.length > 0) {
+        finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
+      }
+
+      // NEW: If the AI forgot the interaction notes, use the user's original message!
+      if (!finalInteractionNotes || finalInteractionNotes.trim() === '') {
+        console.log("[Write Fallback] AI forgot interaction notes. Using user message.");
+        finalInteractionNotes = lastUserMessage; 
+      }
+
       if (!finalCompanyName || finalCompanyName.trim() === '') {
         console.log("[Write Fallback] AI didn't extract the company name. Extracting manually...");
-        const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
         
-        // UPGRADED: Added "of|about|for" to catch more phrases
         const match = lastUserMessage.match(/\b(?:met|with|at|visited|of|about|for)\s+([A-Za-z0-9& ]+?)(?:\s+today|\s+yesterday|\s+this week|\.|,|$)/i);
         if (match && match[1]) {
           finalCompanyName = match[1].trim();
@@ -162,13 +202,10 @@ export async function POST(req: Request) {
         }
       }
 
-      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
-
       if (!finalContacts || finalContacts.length === 0) {
         const contactMatches = lastUserMessage.match(/(?:met with|met|attended|joined|was there)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)/gi);
         if (contactMatches) {
           let extractedContacts = contactMatches.map((c: string) => ({ name: c.replace(/^(met with|met|attended|joined|was there)\s+/i, '').trim() }));
-          // Filter garbage from fallback extraction too!
           finalContacts = extractedContacts.filter((c: { name: string }) => !garbageWords.test(c.name));
         }
       }
@@ -238,7 +275,33 @@ export async function POST(req: Request) {
         accountId = newAccount.id;
       }
 
-      await supabase.from('interactions').insert([{ account_id: accountId, type: interactionType, notes: interactionNotes }]);
+      // ==========================================
+      // 2. Create Interaction AND Auto-Embed
+      // ==========================================
+      const { data: newInteraction } = await supabase
+        .from('interactions')
+        .insert([{
+          account_id: accountId,
+          type: interactionType,
+          notes: finalInteractionNotes, // USE THE FALLBACK NOTES HERE
+        }])
+        .select('id')
+        .single();
+
+      // Generate the vector embedding in the background
+      if (newInteraction) {
+        console.log("[Embedding] Generating vector for interaction...");
+        const embedding = await generateEmbedding(finalInteractionNotes); // USE THE FALLBACK NOTES HERE
+        
+        if (embedding) {
+          // Update the row we just created with the embedding vector
+          await supabase
+            .from('interactions')
+            .update({ embedding: embedding })
+            .eq('id', newInteraction.id);
+          console.log("[Embedding] Vector saved to database!");
+        }
+      }
 
       // 3. Create Contacts - WITH DEDUPE & CLEANUP
       if (finalContacts && finalContacts.length > 0) {
@@ -283,7 +346,6 @@ export async function POST(req: Request) {
     system: `You are Bridgi AI, the intelligent CRM assistant for Narayan S Mahadevan, Founder & CEO of BridgeLabz.
     You are warm, professional, and concise.
     Always address the user as Narayan.
-    
        
     RULES FOR INTENT DETECTION:
     - If the user provides meeting notes, describes an interaction, or says words like "Met", "Attended", "Discussed", or "Follow up", you MUST use the captureMeetingNotes tool. This saves the data to the database.
@@ -295,9 +357,9 @@ export async function POST(req: Request) {
     - If the context contains Action Items, list them clearly with their Priority, Status, and Due Date.
     - NEVER skip the contacts list or action items if they are provided by the tool.
     - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else. Do not add your own summary or mention names that the tool did not confirm.
+    - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.
+    - SEMANTIC SEARCH: If the context includes "semanticMatches", these are past meeting notes found via semantic similarity (meaning-based search). Prioritize them to answer specific questions about what was discussed in the past, even if the exact keywords aren't in the user's question.`,
     
-    - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else. Do not add your own summary or mention names that the tool did not confirm.
-    - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.`,
     messages: coreMessages,
     tools: {
       getAccountInfo: getAccountInfoTool as any,
