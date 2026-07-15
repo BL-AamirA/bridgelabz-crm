@@ -80,6 +80,52 @@ export default function Chat() {
                           const toolName = part.type; 
 
                           // ==========================================
+                          // RENDER DAILY DIGEST
+                          // ==========================================
+                          if (toolName === 'tool-getDailyDigest') {
+                            return (
+                              <div key={i} className="mt-2 text-sm space-y-3 bg-blue-50 p-4 rounded border border-blue-100">
+                                <div className="font-bold text-[#091C2B] text-base flex items-center gap-2">
+                                  📋 Daily Digest
+                                </div>
+
+                                {/* Overdue Action Items */}
+                                {data.overdueActions?.length > 0 ? (
+                                  <div>
+                                    <div className="font-semibold text-xs text-red-600 uppercase tracking-wider">Overdue / Due Today Action Items</div>
+                                    <ul className="mt-1 space-y-1">
+                                      {data.overdueActions.map((a: any, idx: number) => (
+                                        <li key={idx} className="text-gray-800">
+                                          <span className="font-medium">{a.priority}</span> {a.description} 
+                                          <span className="text-gray-500 text-xs ml-1">({a.accounts?.name || 'Unknown Company'} - Due: {a.due_date || 'N/A'})</span>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : (
+                                  <div className="text-green-700 italic">✅ No overdue action items! You are caught up.</div>
+                                )}
+
+                                {/* Stale Accounts */}
+                                {data.staleAccounts?.length > 0 ? (
+                                  <div>
+                                    <div className="font-semibold text-xs text-orange-600 uppercase tracking-wider mt-2">Stale Accounts (No activity in 14+ days)</div>
+                                    <ul className="mt-1 space-y-1">
+                                      {data.staleAccounts.map((acc: any, idx: number) => (
+                                        <li key={idx} className="text-gray-800">
+                                          {acc.name} <span className="text-gray-500 text-xs">({acc.stage} - Last active: {acc.last_activity_at ? acc.last_activity_at.substring(0, 10) : 'Never'})</span>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : (
+                                  <div className="text-green-700 italic">✅ No stale accounts! All pipeline is active.</div>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          // ==========================================
                           // RENDER WRITE CONFIRMATION (Meeting Notes)
                           // ==========================================
                           if (toolName === 'tool-captureMeetingNotes') {

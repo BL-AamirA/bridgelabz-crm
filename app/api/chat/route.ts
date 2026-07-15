@@ -3,6 +3,7 @@ import { generateEmbedding } from '@/lib/embeddings';
 import { streamText } from 'ai';
 import { z } from 'zod';
 import { createServerClientInstance } from '@/lib/supabase-server';
+import { redis } from '@/lib/redis';
 
 // ==========================================
 // TYPE DEFINITIONS
@@ -21,6 +22,12 @@ type ReadToolResult = {
 type WriteToolResult = {
   success?: boolean;
   message?: string;
+};
+
+type DigestToolResult = {
+  error?: string;
+  overdueActions?: any[];
+  staleAccounts?: any[];
 };
 
 // Allow streaming responses up to 30 seconds
@@ -52,11 +59,15 @@ export async function POST(req: Request) {
   const lastUserMessage = coreMessages
     .filter((m: any) => m.role === 'user')
     .pop()?.content || '';
+  const isDigest = /\b(plate|digest|today|tasks|todo)\b/i.test(lastUserMessage) && /\b(what|my|give|show)\b/i.test(lastUserMessage);
   const isQuestion = /\?$/.test(lastUserMessage.trim()) || /^(what|who|how|show|list|status|are|is)\b/i.test(lastUserMessage);
   const isNotes = /\b(met|attended|discussed|follow up|had a meeting|called|visited)\b/i.test(lastUserMessage) && !isQuestion;
 
   let toolChoice: any = 'auto';
-  if (isQuestion) {
+  if (isDigest) {
+    console.log("[Router] Detected Digest Request -> Forcing getDailyDigest tool");
+    toolChoice = { type: 'tool', toolName: 'getDailyDigest' };
+  } else if (isQuestion) {
     console.log("[Router] Detected Question -> Forcing getAccountInfo tool");
     toolChoice = { type: 'tool', toolName: 'getAccountInfo' };
   } else if (isNotes) {
@@ -329,6 +340,11 @@ export async function POST(req: Request) {
           if (embedding) {
             await supabase.from('interactions').update({ embedding: embedding }).eq('id', newInteraction.id);
             console.log("[Embedding] Vector saved to database!");
+            // Update the account's last_activity_at timestamp
+            await supabase
+              .from('accounts')
+              .update({ last_activity_at: new Date().toISOString().split('T')[0] })
+              .eq('id', accountId);
           }
         }
       } else {
@@ -370,6 +386,55 @@ export async function POST(req: Request) {
     },
   };
 
+    const getDailyDigestTool = {
+    description: 'Fetches the daily digest for the user. Use this ONLY when the user asks "What is on my plate?", "What are my tasks today?", or "Daily digest".',
+    parameters: z.object({}), // No parameters needed from AI
+    execute: async (): Promise<DigestToolResult> => {
+      console.log("[Digest Pipeline] Checking Redis cache...");
+      const supabase = await createServerClientInstance();
+      
+      // 1. CHECK REDIS CACHE FIRST
+      const cacheKey = `daily-digest-${new Date().toISOString().split('T')[0]}`;
+      const cachedData = await redis.get(cacheKey);
+      
+      if (cachedData) {
+        console.log("[Digest Pipeline] Cache HIT! Returning cached digest data.");
+        return cachedData as DigestToolResult;
+      }
+
+      console.log("[Digest Pipeline] Cache MISS. Querying Supabase...");
+      
+      // 2. FETCH FROM SUPABASE
+      const today = new Date().toISOString().split('T')[0];
+      const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+      // Fetch overdue and due-today action items
+      const { data: overdueActions } = await supabase
+        .from('action_items')
+        .select('description, priority, due_date, status, accounts(name)')
+        .eq('status', 'open')
+        .lte('due_date', today);
+
+      // Fetch stale accounts (no activity in 14 days)
+      const { data: staleAccounts } = await supabase
+        .from('accounts')
+        .select('name, stage, last_activity_at')
+        .lt('last_activity_at', twoWeeksAgo)
+        .neq('stage', 'Closed Won'); // Ignore closed accounts
+
+      const digestData = {
+        overdueActions: overdueActions || [],
+        staleAccounts: staleAccounts || []
+      };
+
+      // 3. SAVE TO REDIS CACHE (Expires in 1 hour / 3600 seconds)
+      await redis.set(cacheKey, digestData, { ex: 3600 });
+      console.log("[Digest Pipeline] Data cached for 1 hour.");
+
+      return digestData;
+    },
+  };
+
   // ==========================================
   // AGENTIC RAG PIPELINE 
   // ==========================================
@@ -384,6 +449,11 @@ export async function POST(req: Request) {
     - If the user asks a QUESTION about a company (e.g., "What is the status of X?", "Who are the contacts at Y?", "What are the action items?"), you MUST use the getAccountInfo tool.
     - Do NOT use getAccountInfo if the user is giving you meeting notes! captureMeetingNotes is for SAVING data, getAccountInfo is for READING data.
     
+    - DIGEST RULES: When the getDailyDigest tool returns data, you MUST present it clearly as a Daily Digest.
+    - First, list the Overdue Action Items, grouping them by Priority (P1 first, then P2, then P3). Mention which company the action item belongs to.
+    - Second, list the Stale Accounts (no activity in 14+ days) and suggest the user reach out to them.
+    - If there are no overdue items or stale accounts, congratulate the user on being caught up!
+
     RULES FOR RENDERING:
     - After the tool returns data, you MUST present it clearly.
     - If the context contains Action Items, list them clearly with their Priority, Status, and Due Date.
@@ -396,9 +466,12 @@ export async function POST(req: Request) {
     tools: {
       getAccountInfo: getAccountInfoTool as any,
       captureMeetingNotes: captureMeetingNotesTool as any,
+      getDailyDigest: getDailyDigestTool as any,
     },
+    
     toolChoice,
     // maxSteps: 5,
+    
   });
 
   return result.toUIMessageStreamResponse();
