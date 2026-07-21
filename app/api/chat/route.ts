@@ -1,9 +1,10 @@
 import { google } from '@ai-sdk/google';
 import { generateEmbedding } from '@/lib/embeddings';
-import { streamText } from 'ai';
+// import { streamText } from 'ai';
 import { z } from 'zod';
 import { createServerClientInstance } from '@/lib/supabase-server';
-import { redis } from '@/lib/redis';
+import { redis } from '@/lib/redis';  
+import { streamText, generateText } from 'ai';
 
 // ==========================================
 // TYPE DEFINITIONS
@@ -28,6 +29,18 @@ type DigestToolResult = {
   error?: string;
   overdueActions?: any[];
   staleAccounts?: any[];
+};
+
+type DraftToolResult = {
+  error?: string;
+  found?: boolean;
+  message?: string;
+  contact?: any;
+  account?: any;
+  recentInteractions?: any[];
+  channel?: string;     // ADDED
+  objective?: string;  
+  draftText?: string;
 };
 
 // Allow streaming responses up to 30 seconds
@@ -59,12 +72,16 @@ export async function POST(req: Request) {
   const lastUserMessage = coreMessages
     .filter((m: any) => m.role === 'user')
     .pop()?.content || '';
+  const isDraft = /\b(draft|write|compose|create)\b/i.test(lastUserMessage) && /\b(email|whatsapp|message|linkedin)\b/i.test(lastUserMessage);
   const isDigest = /\b(plate|digest|today|tasks|todo)\b/i.test(lastUserMessage) && /\b(what|my|give|show)\b/i.test(lastUserMessage);
   const isQuestion = /\?$/.test(lastUserMessage.trim()) || /^(what|who|how|show|list|status|are|is)\b/i.test(lastUserMessage);
   const isNotes = /\b(met|attended|discussed|follow up|had a meeting|called|visited)\b/i.test(lastUserMessage) && !isQuestion;
 
-  let toolChoice: any = 'auto';
-  if (isDigest) {
+let toolChoice: any = 'auto';
+  if (isDraft) {
+    console.log("[Router] Detected Draft Request -> Forcing draftCommunication tool");
+    toolChoice = { type: 'tool', toolName: 'draftCommunication' };
+  }else if (isDigest) {
     console.log("[Router] Detected Digest Request -> Forcing getDailyDigest tool");
     toolChoice = { type: 'tool', toolName: 'getDailyDigest' };
   } else if (isQuestion) {
@@ -386,6 +403,149 @@ export async function POST(req: Request) {
     },
   };
 
+    const draftCommunicationTool = {
+    description: 'Fetches context to draft a communication (email, whatsapp, linkedin). Use this when the user asks to "draft", "write", or "compose" a message to a specific person.',
+    parameters: z.object({
+      contactName: z.string().describe('The name of the person to draft the message to.'),
+      channel: z.string().describe('The communication channel. Must be "email", "whatsapp", or "linkedin".'),
+      objective: z.string().optional().describe('The goal of the message, if specified by the user (e.g., "follow up on proposal").'),
+    }),
+    execute: async ({ contactName, channel, objective }: { contactName: string; channel: string; objective?: string }): Promise<DraftToolResult> => {
+      let finalContactName = contactName;
+      let finalChannel = channel;
+      let finalObjective = objective;
+
+      // Extract user message for fallbacks
+      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
+
+      // ==========================================
+      // FALLBACKS: If AI forgets parameters, extract manually
+      // ==========================================
+      
+      // 1. Contact Name Fallback
+      if (!finalContactName || finalContactName.trim() === '' || finalContactName === 'undefined') {
+        console.log("[Draft Fallback] AI forgot contact name. Extracting manually...");
+        // Look for "to [Name] at" or "to [Name] about"
+        const match = lastUserMessage.match(/\b(?:to|for)\s+([A-Za-z]+(?:\s[A-Za-z]+)*)\s+(?:at|about|regarding)/i);
+        if (match && match[1]) {
+          finalContactName = match[1].trim();
+          console.log(`[Draft Fallback] Extracted contact: ${finalContactName}`);
+        } else {
+          return { found: false, message: "Who would you like to draft this message to? Please specify a contact name." };
+        }
+      }
+
+      // 2. Channel Fallback
+      if (!finalChannel || finalChannel.trim() === '' || finalChannel === 'undefined') {
+        console.log("[Draft Fallback] AI forgot channel. Extracting manually...");
+        if (/whatsapp/i.test(lastUserMessage)) finalChannel = 'whatsapp';
+        else if (/email/i.test(lastUserMessage)) finalChannel = 'email';
+        else if (/linkedin/i.test(lastUserMessage)) finalChannel = 'linkedin';
+        else finalChannel = 'email'; // Default to email
+      }
+
+      // 3. Objective Fallback
+      if (!finalObjective || finalObjective.trim() === '' || finalObjective === 'undefined') {
+        // Just use the whole user message as the objective context
+        finalObjective = lastUserMessage; 
+      }
+            // ==========================================
+      // CLEANUP: Strip "at Company" or "about Topic" from contact name
+      // ==========================================
+      if (finalContactName) {
+        finalContactName = finalContactName.replace(/\s+(at|about|regarding|from|for)\s+.*$/i, '').trim();
+      }
+      console.log(`[Draft Pipeline] Fetching context for contact: ${finalContactName}, channel: ${finalChannel}`);
+      const supabase = await createServerClientInstance();
+      
+      // 1. Find the Contact
+      const { data: contact } = await supabase
+        .from('contacts')
+        .select('*, accounts(*)')
+        .ilike('name', `%${finalContactName}%`)
+        .limit(1)
+        .single();
+
+      if (!contact) {
+        return { found: false, message: `Contact "${finalContactName}" not found in the database.` };
+      }
+
+      const accountId = contact.account_id;
+
+      // 2. Get Last 3 Interactions for Context
+      const { data: interactions } = await supabase
+        .from('interactions')
+        .select('type, notes, date')
+        .eq('account_id', accountId)
+        .order('date', { ascending: false })
+        .limit(3);
+
+            // 3. GENERATE THE DRAFT (Sub-Agent Pattern)
+      let toneInstruction = "";
+      let fewShotExample = "";
+      
+      if (finalChannel === 'whatsapp') {
+        toneInstruction = "Write a short, warm, informal WhatsApp message. Use emojis (👋, 🚀, ✅). Get straight to the point. No subject line. End with '- Narayan'.";
+        fewShotExample = `
+        Example WhatsApp:
+        Hi Praveen 👋 Great meeting you today! Just sharing the deck we discussed regarding the COE lab setup 🚀 Let me know your thoughts when you have a moment. ✅ - Narayan`;
+      } else if (finalChannel === 'email') {
+        toneInstruction = "Write a professional, formal, structured email. Start with 'Dear [Name]', end with 'Best regards, Narayan'. Include a subject line.";
+        fewShotExample = `
+        Example Email:
+        Subject: Follow up: BridgeLabz Partnership Discussion
+
+        Dear Praveen,
+
+        It was a pleasure meeting with you and the Kyndryl team today. 
+
+        As discussed, I have attached the proposal for the compliance training module. We believe this aligns perfectly with your upskilling goals for Q3.
+
+        Please let me know if you need any further information.
+
+        Best regards,
+        Narayan`;
+      } else {
+        toneInstruction = "Write a professional but conversational LinkedIn message.";
+        fewShotExample = "";
+      }
+
+      const interactionsContext = (interactions || []).map((int: any) => `- (${int.date}) ${int.notes}`).join('\n');
+
+      console.log(`[Draft Pipeline] Generating ${finalChannel} draft with AI...`);
+      const { text: draftText } = await generateText({
+        model: google('gemini-2.5-flash'),
+        prompt: `You are Bridgi AI, the CRM assistant for Narayan S Mahadevan.
+        Objective: ${finalObjective}
+        Contact Name: ${contact.name} (${contact.title || 'No title'})
+        Company: ${contact.accounts?.name || 'Unknown'} (Stage: ${contact.accounts?.stage || 'Unknown'})
+        Recent Meeting Notes:\n${interactionsContext}
+
+        ${toneInstruction}
+        ${fewShotExample}
+
+        Write the message now:`
+      });
+
+      return {
+        found: true,
+        contact: { name: contact.name, title: contact.title, email: contact.email },
+        account: { name: contact.accounts?.name, stage: contact.accounts?.stage },
+        channel: finalChannel,
+        draftText: draftText // Return the generated draft!
+      };
+
+      // return {
+      //   found: true,
+      //   contact: { name: contact.name, title: contact.title, email: contact.email },
+      //   account: { name: contact.accounts?.name, stage: contact.accounts?.stage },
+      //   recentInteractions: interactions || [],
+      //   channel: finalChannel, // Pass channel back so AI knows how to format
+      //   objective: finalObjective // Pass objective back
+      // };
+    },
+  };
+
     const getDailyDigestTool = {
     description: 'Fetches the daily digest for the user. Use this ONLY when the user asks "What is on my plate?", "What are my tasks today?", or "Daily digest".',
     parameters: z.object({}), // No parameters needed from AI
@@ -460,13 +620,21 @@ export async function POST(req: Request) {
     - NEVER skip the contacts list or action items if they are provided by the tool.
     - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else. Do not add your own summary or mention names that the tool did not confirm.
     // - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.
-    - SEMANTIC SEARCH: If the context includes "semanticMatches", these are past meeting notes found via semantic similarity (meaning-based search). Prioritize them to answer specific questions about what was discussed in the past, even if the exact keywords aren't in the user's question.`,
+    - SEMANTIC SEARCH: If the context includes "semanticMatches", these are past meeting notes found via semantic similarity (meaning-based search). Prioritize them to answer specific questions about what was discussed in the past, even if the exact keywords aren't in the user's question.
+    
+    - DRAFTING RULES: When the draftCommunication tool returns data, you MUST draft the message based on the channel.
+    - EMAIL TONE: Professional, formal, structured. Use BridgeLabz voice (warm but corporate). Start with "Dear [Name]", end with "Best regards, Narayan". Include a subject line.
+    - WHATSAPP TONE: Short, warm, informal. Use emojis (👋, 🚀, ✅). Get straight to the point. No subject line. End with "- Narayan".
+    - LINKEDIN TONE: Professional but conversational. Good for connection requests or brief follow-ups.
+    - CONTEXT INTEGRATION: You MUST read the recentInteractions provided. Mention specifics from the last meeting (e.g., "It was great discussing compliance training..."). If an objective was provided, focus the message on that objective.
+    - Do NOT output the draft as a tool result. Output the draft directly as your text response so the user can read it easily.`,
     
     messages: coreMessages,
     tools: {
       getAccountInfo: getAccountInfoTool as any,
       captureMeetingNotes: captureMeetingNotesTool as any,
       getDailyDigest: getDailyDigestTool as any,
+      draftCommunication: draftCommunicationTool as any,
     },
     
     toolChoice,

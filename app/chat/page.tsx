@@ -74,10 +74,29 @@ export default function Chat() {
                           );
                         }
                         
-                        // If the tool finished
+                        // If the tool finished                                         
                         if (toolPart.state === 'output-available') {
                           const data = toolPart.output;
                           const toolName = part.type; 
+
+                          // ==========================================
+                          // RENDER WRITE CONFIRMATION (Meeting Notes)
+                          // ==========================================
+                          if (toolName === 'tool-captureMeetingNotes') {
+                            if (data.success) {
+                              return (
+                                <div key={i} className="mt-2 bg-green-50 border border-green-200 text-green-800 p-3 rounded text-sm flex items-start gap-2">
+                                  <span className="text-lg">✅</span>
+                                  <div>
+                                    <div className="font-bold">Saved to CRM!</div>
+                                    <div>{data.message}</div>
+                                  </div>
+                                </div>
+                              );
+                            } else {
+                              return <div key={i} className="text-red-500 text-sm mt-1 bg-red-50 p-2 rounded border border-red-200">{JSON.stringify(data)}</div>;
+                            }
+                          }
 
                           // ==========================================
                           // RENDER DAILY DIGEST
@@ -126,30 +145,35 @@ export default function Chat() {
                           }
 
                           // ==========================================
-                          // RENDER WRITE CONFIRMATION (Meeting Notes)
+                          // RENDER DRAFT COMMUNICATION (WITH COPY BUTTON)
                           // ==========================================
-                          if (toolName === 'tool-captureMeetingNotes') {
-                            if (data.success) {
+                          if (toolName === 'tool-draftCommunication') {
+                            if (data.found === false) {
+                              return <div key={i} className="text-red-500 text-sm mt-1">{data.message}</div>;
+                            }
+                            if (data.draftText) {
                               return (
-                                <div key={i} className="mt-2 bg-green-50 border border-green-200 text-green-800 p-3 rounded text-sm flex items-start gap-2">
-                                  <span className="text-lg">✅</span>
-                                  <div>
-                                    <div className="font-bold">Saved to CRM!</div>
-                                    <div>{data.message}</div>
+                                <div key={i} className="mt-2 bg-white border border-gray-200 p-4 rounded shadow-sm relative group">
+                                  <div className="font-bold text-[#091C2B] text-base mb-2">
+                                    📝 Draft {data.channel ? data.channel.charAt(0).toUpperCase() + data.channel.slice(1) : ''} to {data.contact?.name} at {data.account?.name}
                                   </div>
+                                  <button 
+                                    onClick={() => navigator.clipboard.writeText(data.draftText)}
+                                    className="absolute top-2 right-2 bg-[#091C2B] text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition"
+                                  >
+                                    📋 Copy
+                                  </button>
+                                  <div className="whitespace-pre-wrap text-sm text-gray-800 bg-gray-50 p-3 rounded border border-gray-100">{data.draftText}</div>
                                 </div>
                               );
-                            } else {
-                              return <div key={i} className="text-red-500 text-sm mt-1 bg-red-50 p-2 rounded border border-red-200">{JSON.stringify(data)}</div>;
                             }
+                            return null;
                           }
 
                           // ==========================================
                           // RENDER READ DATA (Account Info)
                           // ==========================================
-                          
-                          // FIX: Find the user message that immediately precedes THIS AI message
-                          // This prevents old cards from mutating when a new question is asked!
+                          // Find the user message that immediately precedes THIS AI message
                           let triggeringUserText = '';
                           if (messageIndex > 0 && messages[messageIndex - 1].role === 'user') {
                             triggeringUserText = messages[messageIndex - 1].parts
@@ -160,7 +184,6 @@ export default function Chat() {
 
                           let uiFocus = toolPart.input?.focus || 'full'; 
 
-                          // Override focus based on the specific user question that triggered this card
                           if (triggeringUserText.includes('action item') || triggeringUserText.includes('task') || triggeringUserText.includes('todo') || triggeringUserText.includes('follow up')) {
                             uiFocus = 'action_items';
                           } else if (triggeringUserText.includes('contact') || triggeringUserText.includes('person') || triggeringUserText.includes('who')) {
@@ -182,7 +205,6 @@ export default function Chat() {
                                 </span>
                               </div>
                               
-                              {/* Contacts */}
                               {(uiFocus === 'full' || uiFocus === 'contacts') && data.contacts?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Contacts</div>
@@ -199,7 +221,6 @@ export default function Chat() {
                                  <div className="text-gray-500 italic">No contacts found for {data.account.name}.</div>
                               )}
 
-                              {/* Interactions */}
                               {(uiFocus === 'full' || uiFocus === 'interactions') && data.interactions?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Recent Interactions</div>
@@ -216,7 +237,6 @@ export default function Chat() {
                                  <div className="text-gray-500 italic">No recent interactions found for {data.account.name}.</div>
                               )}
 
-                              {/* Action Items */}
                               {(uiFocus === 'full' || uiFocus === 'action_items') && data.actionItems?.length > 0 && (
                                 <div>
                                   <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Action Items</div>
