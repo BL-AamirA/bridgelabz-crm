@@ -17,7 +17,7 @@ type ReadToolResult = {
   contacts?: any[];
   interactions?: any[];
   actionItems?: any[];
-  semanticMatches?: any[]; // NEW: for vector search results
+  semanticMatches?: any[];
 };
 
 type WriteToolResult = {
@@ -38,9 +38,27 @@ type DraftToolResult = {
   contact?: any;
   account?: any;
   recentInteractions?: any[];
-  channel?: string;     // ADDED
+  channel?: string;
   objective?: string;  
   draftText?: string;
+};
+
+type ProposeActionToolResult = {
+  actionType: string;
+  targetAccount: string;
+  newValue: string;
+  confirmationMessage: string;
+};
+
+type ExecuteActionToolResult = {
+  success: boolean;
+  message: string;
+};
+
+type TeamPlateToolResult = {
+  error?: string;
+  teamMember?: string;
+  tasks?: any[];
 };
 
 // Allow streaming responses up to 30 seconds
@@ -66,22 +84,35 @@ export async function POST(req: Request) {
     return !(m.role === prev.role && m.content === prev.content);
   });
 
-    // ==========================================
-  // DETERMINISTIC ROUTING
-  // ==========================================
   const lastUserMessage = coreMessages
     .filter((m: any) => m.role === 'user')
     .pop()?.content || '';
+
+  // ==========================================
+  // DETERMINISTIC ROUTING (Order Matters!)
+  // ==========================================
+  const isExecutionConfirmation = /\b(confirmed: execute)\b/i.test(lastUserMessage);
+  const isNotes = /\b(met|attended|discussed|follow up|had a meeting|called|visited)\b/i.test(lastUserMessage) && !isExecutionConfirmation;
+  const isNewProposal = !isExecutionConfirmation && !isNotes && (/\b(assign|update|change|set)\b/i.test(lastUserMessage) && /\b(spoc|owner|stage|assign)\b/i.test(lastUserMessage));
+  const isTeamPlate = /\b(piyush|jomy|puneet|manoj|narayan)\b/i.test(lastUserMessage) && /\b(tasks|action items|plate|to-do)\b/i.test(lastUserMessage);
   const isDraft = /\b(draft|write|compose|create)\b/i.test(lastUserMessage) && /\b(email|whatsapp|message|linkedin)\b/i.test(lastUserMessage);
   const isDigest = /\b(plate|digest|today|tasks|todo)\b/i.test(lastUserMessage) && /\b(what|my|give|show)\b/i.test(lastUserMessage);
   const isQuestion = /\?$/.test(lastUserMessage.trim()) || /^(what|who|how|show|list|status|are|is)\b/i.test(lastUserMessage);
-  const isNotes = /\b(met|attended|discussed|follow up|had a meeting|called|visited)\b/i.test(lastUserMessage) && !isQuestion;
 
-let toolChoice: any = 'auto';
-  if (isDraft) {
+  let toolChoice: any = 'auto';
+  if (isExecutionConfirmation) {
+    console.log("[Router] Detected Execution Confirmation -> Forcing executeAction tool");
+    toolChoice = { type: 'tool', toolName: 'executeAction' };
+  } else if (isNewProposal) {
+    console.log("[Router] Detected New Action Proposal -> Forcing proposeAction tool");
+    toolChoice = { type: 'tool', toolName: 'proposeAction' };
+  } else if (isTeamPlate) {
+    console.log("[Router] Detected Team Plate Request -> Forcing getTeamPlate tool");
+    toolChoice = { type: 'tool', toolName: 'getTeamPlate' };
+  } else if (isDraft) {
     console.log("[Router] Detected Draft Request -> Forcing draftCommunication tool");
     toolChoice = { type: 'tool', toolName: 'draftCommunication' };
-  }else if (isDigest) {
+  } else if (isDigest) {
     console.log("[Router] Detected Digest Request -> Forcing getDailyDigest tool");
     toolChoice = { type: 'tool', toolName: 'getDailyDigest' };
   } else if (isQuestion) {
@@ -93,93 +124,73 @@ let toolChoice: any = 'auto';
   }
 
   // ==========================================
-  // TOOL DEFINITIONS (Plain objects to bypass TS bug)
+  // TOOL DEFINITIONS
   // ==========================================
   const getAccountInfoTool = {
-    description: 'Fetches existing account details, contacts, interactions, and action items from the CRM database. Use this ONLY when the user asks a QUESTION about a specific company (e.g., "What is the status of X?", "Who are the contacts at Y?").',
+    description: 'Fetches existing account details, contacts, interactions, and action items from the CRM database. Use this ONLY when the user asks a QUESTION about a specific company.',
     parameters: z.object({
       companyName: z.string().describe('The exact name of the company the user is asking about.'),
-      focus: z.string().describe('What specific information the user is asking about. Possible values: "full", "status", "contacts", "action_items", "interactions".'),
+      focus: z.string().describe('What specific information the user is asking about.'),
     }),
     execute: async ({ companyName, focus }: { companyName: string; focus: string }): Promise<ReadToolResult> => {
-          
       if (!companyName || companyName.trim() === '') {
-        console.log("[Read Fallback] AI didn't extract the name. Extracting manually...");
         let lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
         lastUserMessage = lastUserMessage.replace(/"/g, '');
-        
         let match = lastUserMessage.match(/\b(?:at|for|of|with|about)\s+([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)/);
         if (match && match[1]) {
           companyName = match[1].trim();
         } else {
-          // Fallback 2: Just grab the last capitalized word before the question mark (e.g., "status of Kyndryl?")
           const lastWordMatch = lastUserMessage.match(/([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)\s*\?/);
-          if (lastWordMatch && lastWordMatch[1]) {
-            companyName = lastWordMatch[1].trim();
-          } else {
-            return { error: "No company name was provided. Please ask the user which company they are referring to." };
-          }
+          if (lastWordMatch && lastWordMatch[1]) companyName = lastWordMatch[1].trim();
+          else return { error: "No company name was provided." };
         }
       }
 
-      console.log(`[RAG Pipeline] Fetching data for company: ${companyName}`);
       const supabase = await createServerClientInstance();
-      
       const { data: account } = await supabase.from('accounts').select('*').ilike('name', `%${companyName}%`).limit(1).single();
-      if (!account) return { found: false, message: `Account "${companyName}" not found in the database.` };
+      if (!account) return { found: false, message: `Account "${companyName}" not found.` };
 
       const { data: contacts } = await supabase.from('contacts').select('name, title, email').eq('account_id', account.id);
       const { data: interactions } = await supabase.from('interactions').select('type, notes, date').eq('account_id', account.id).order('date', { ascending: false }).limit(3);
-      // Filter out blank interactions so the AI doesn't see them
-      const cleanInteractions = (interactions || []).filter((int: any) => int.notes && int.notes.trim() !== '');      const { data: actionItems } = await supabase.from('action_items').select('description, priority, due_date, status').eq('account_id', account.id).order('due_date', { ascending: true });
+      const cleanInteractions = (interactions || []).filter((int: any) => int.notes && int.notes.trim() !== '');      
+      const { data: actionItems } = await supabase.from('action_items').select('description, priority, due_date, status').eq('account_id', account.id).order('due_date', { ascending: true });
       
-      // ==========================================
-      // SEMANTIC SEARCH (Vector Search)
-      // ==========================================
       let semanticMatches: any[] = [];
-      console.log("[Semantic Search] Embedding user query...");
       const queryEmbedding = await generateEmbedding(lastUserMessage);
-      
       if (queryEmbedding) {
-        console.log("[Semantic Search] Querying pgvector for matches...");
-        const { data: matches } = await supabase.rpc('match_interactions', {
-          query_embedding: queryEmbedding,
-          match_account_id: account.id,
-          match_count: 3
-        });
+        const { data: matches } = await supabase.rpc('match_interactions', { query_embedding: queryEmbedding, match_account_id: account.id, match_count: 3 });
         semanticMatches = matches || [];
-        console.log(`[Semantic Search] Found ${semanticMatches.length} semantic matches!`);
       }
 
-      // Filter out garbage names from existing DB data just in case
       const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp)\b/i;
       const cleanContacts = (contacts || []).filter((c: any) => !garbageWords.test(c.name));
 
-        return {
+      return {
         found: true,
         account: { name: account.name, type: account.type, stage: account.stage, city: account.city },
         contacts: cleanContacts,
         interactions: cleanInteractions, 
         actionItems: actionItems || [],
-        semanticMatches: semanticMatches 
+        semanticMatches 
       };
     },
   };
 
   const captureMeetingNotesTool = {
-    description: 'Saves meeting notes and interactions to the CRM database. Use this ONLY when the user provides NEW information or describes a past event. Trigger words: "Met", "Attended", "Discussed", "Follow up", "Had a meeting". Do NOT use this if the user is just asking a question.',
+    description: 'Saves meeting notes and interactions to the CRM database. Use this ONLY when the user provides NEW information.',
     parameters: z.object({
-      companyName: z.string().describe('The name of the company discussed. JUST the proper noun, e.g., "Kyndryl". NEVER include words like "with", "at", "met", or "visited" in this string.'),
-      interactionType: z.string().describe('The type of interaction. Possible values: "meeting", "email", "whatsapp", "linkedin".'),
-      interactionNotes: z.string().describe('A detailed summary of EVERYTHING discussed in the meeting. Never leave this blank. If the user says "Discussed regulatory compliance", write "Discussed regulatory compliance".'),
+      companyName: z.string().describe('The name of the company discussed.'),
+      interactionType: z.string().describe('The type of interaction.'),
+      interactionNotes: z.string().describe('A detailed summary of EVERYTHING discussed.'),
       contacts: z.array(z.object({
-        name: z.string().describe('The FIRST and LAST name of a HUMAN PERSON. Do NOT put event descriptions, companies, or sentences here. Only proper names like "Sunder Pichai".'),
-        title: z.string().optional().describe('Job title of the person, if mentioned.'),
-      })).describe('Array of ALL people mentioned. NEVER include meeting details or companies in the name field.'),
+        name: z.string().describe('The FIRST and LAST name of a HUMAN PERSON.'),
+        title: z.string().optional(),
+      })).describe('Array of ALL people mentioned.'),
       actionItems: z.array(z.object({
         description: z.string().describe('What needs to be done.'),
-        priority: z.string().describe('Priority: "P1" (Urgent), "P2" (Next Week), "P3" (Delegate)'),
-        dueDate: z.string().describe('Due date in YYYY-MM-DD format or relative like "Next week"').optional(),
+        priority: z.string().describe('Priority: P1, P2, P3'),
+        dueDate: z.string().optional(),
+        assignedTo: z.string().optional(),
       })).describe('Array of ALL follow-ups, tasks, or next steps mentioned.'),
     }),
     execute: async ({ companyName, interactionType, interactionNotes, contacts, actionItems }: { 
@@ -187,7 +198,7 @@ let toolChoice: any = 'auto';
       interactionType: string; 
       interactionNotes: string; 
       contacts: { name: string, title?: string }[]; 
-      actionItems: { description: string, priority: string, dueDate?: string }[] 
+      actionItems: { description: string, priority: string, dueDate?: string, assignedTo?: string }[] 
     }): Promise<WriteToolResult> => {
       
       let finalCompanyName = companyName;
@@ -195,54 +206,31 @@ let toolChoice: any = 'auto';
       let finalActionItems: any[] = actionItems || [];
       let finalInteractionNotes = interactionNotes; 
 
-      // Extract user message ONCE at the top for all fallbacks
       const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
 
       // ==========================================
-      // CLEAN COMPANY NAME FIRST! (Crucial for contact filter)
+      // 1. CLEANUP: COMPANY & CONTACTS
       // ==========================================
       if (finalCompanyName) {
         finalCompanyName = finalCompanyName.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim();
       }
 
-      // ==========================================
-      // GARBAGE FILTER & COMPANY FILTER (NUCLEAR OPTION)
-      // ==========================================
       const garbageWords = /\b(meeting|today|yesterday|tomorrow|discuss|follow|company|integration|at|the|a|visited|email|whatsapp|met|with|about|for|of)\b/i;
-      
-      // 1. Filter garbage words
       finalContacts = finalContacts.filter(c => !garbageWords.test(c.name));
+      finalContacts = finalContacts.map(c => ({ ...c, name: c.name.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim() }));
 
-      // 2. Strip leading prepositions (e.g. "with Kyndryl" -> "Kyndryl")
-      finalContacts = finalContacts.map(c => ({
-        ...c,
-        name: c.name.replace(/^(met with|met|with|at|visited|about|for|of)\s+/i, '').trim()
-      }));
-
-      // 3. NUCLEAR: If the contact name matches the company name (exactly or contains it), REMOVE IT.
       if (finalCompanyName && finalCompanyName.trim() !== '') {
-        finalContacts = finalContacts.filter(c => {
-          const contactLower = c.name.toLowerCase();
-          const companyLower = finalCompanyName.toLowerCase();
-          return contactLower !== companyLower && !contactLower.includes(companyLower);
-        });
+        finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
       }
 
-      // NEW: If the AI forgot the interaction notes, use the user's original message!
       if (!finalInteractionNotes || finalInteractionNotes.trim() === '') {
-        console.log("[Write Fallback] AI forgot interaction notes. Using user message.");
         finalInteractionNotes = lastUserMessage; 
       }
 
-      // UPGRADED: If AI forgets, or passes lazy text starting with "with" or "met", force proper extraction
       if (!finalCompanyName || finalCompanyName.trim() === '' || /^(met with|met|with|at|visited|about|for|of)\b/i.test(finalCompanyName)) {
-        console.log("[Write Fallback] AI didn't extract the company name properly. Extracting manually...");
         const match = lastUserMessage.match(/\b(?:met with|met|at|visited|of|about|for)\s+([A-Z][a-z0-9&]+(?:\s[A-Z][a-z0-9&]+)*)/i);
-        if (match && match[1]) {
-          finalCompanyName = match[1].trim();
-        } else {
-          return { success: false, message: "I understood the meeting notes, but I couldn't figure out which company you met with. Could you please specify the company name?" };
-        }
+        if (match && match[1]) finalCompanyName = match[1].trim();
+        else return { success: false, message: "Couldn't figure out which company you met with." };
       }
 
       if (!finalContacts || finalContacts.length === 0) {
@@ -250,66 +238,72 @@ let toolChoice: any = 'auto';
         if (contactMatches) {
           let extractedContacts = contactMatches.map((c: string) => ({ name: c.replace(/^(met with|met|attended|joined|was there)\s+/i, '').trim() }));
           finalContacts = extractedContacts.filter((c: { name: string }) => !garbageWords.test(c.name));
-          
-          // NUCLEAR: Filter company name from regex extraction too!
-          if (finalCompanyName) {
-             finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
-          }
+          if (finalCompanyName) finalContacts = finalContacts.filter(c => c.name.toLowerCase() !== finalCompanyName.toLowerCase());
         }
       }
 
-      if (!finalActionItems || finalActionItems.length === 0) {
-        const actionMatch = lastUserMessage.match(/(follow up on .*?|action: .*?|todo: .*?)(?:\.|$)/gi);
-        if (actionMatch) {
-          finalActionItems = actionMatch.map((a: string) => ({ description: a.trim(), priority: 'P2', dueDate: undefined }));
-        }
-      } 
+      // ==========================================
+      // 2. DETERMINISTIC ACTION ITEM PARSER (Expert Mode)
+      // ==========================================
+      let parsedDueDate: string | null = null;
+      let parsedAssignee = 'Narayan';
       
-      if (finalActionItems && finalActionItems.length > 0) {
-        const firstItem = finalActionItems[0];
-        if (!firstItem.dueDate || firstItem.dueDate.trim() === '') {              
-          if (/\btomorrow\b/i.test(lastUserMessage)) {
-            const d = new Date(); d.setDate(d.getDate() + 1); firstItem.dueDate = d.toISOString().split('T')[0];
-          } else if (/\btoday\b/i.test(lastUserMessage)) {
-            firstItem.dueDate = new Date().toISOString().split('T')[0];
-          } else {
-            const dateMatch = lastUserMessage.match(/(?:by|before|on)\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?)/i);
-            if (dateMatch && dateMatch[1]) {
-              const currentYear = new Date().getFullYear();
-              const monthMap: Record<string, string> = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
-              const month = monthMap[dateMatch[1].toLowerCase().substring(0, 3)];
-              const day = dateMatch[1].match(/\d{1,2}/)?.[0].padStart(2, '0');
-              if (month && day) firstItem.dueDate = `${currentYear}-${month}-${day}`;
-            } else if (/\bnext week\b/i.test(lastUserMessage)) {
-              const d = new Date(); d.setDate(d.getDate() + 7); firstItem.dueDate = d.toISOString().split('T')[0];
-            }
-          }
+      // A. Parse Assignee strictly
+      const assignMatch = lastUserMessage.match(/\bassign(?:ed)?\s+to\s+([A-Za-z]+)/i);
+      if (assignMatch && assignMatch[1]) {
+        parsedAssignee = assignMatch[1].trim();
+      }
+
+      // B. Parse Due Date strictly
+      if (/\btomorrow\b/i.test(lastUserMessage)) {
+        const d = new Date(); d.setDate(d.getDate() + 1); parsedDueDate = d.toISOString().split('T')[0];
+      } else if (/\btoday\b/i.test(lastUserMessage)) {
+        parsedDueDate = new Date().toISOString().split('T')[0];
+      } else if (/\bnext week\b/i.test(lastUserMessage)) {
+        const d = new Date(); d.setDate(d.getDate() + 7); parsedDueDate = d.toISOString().split('T')[0];
+      } else {
+        const dateMatch = lastUserMessage.match(/(?:by|before|on)\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?)/i);
+        if (dateMatch && dateMatch[1]) {
+          const currentYear = new Date().getFullYear();
+          const monthMap: Record<string, string> = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+          const month = monthMap[dateMatch[1].toLowerCase().substring(0, 3)];
+          const day = dateMatch[1].match(/\d{1,2}/)?.[0].padStart(2, '0');
+          if (month && day) parsedDueDate = `${currentYear}-${month}-${day}`;
         }
       }
 
+      // C. Parse Action Items if AI got lazy and returned nothing
+      if (!finalActionItems || finalActionItems.length === 0) {
+        console.log("[Write Fallback] AI didn't return action items. Force extracting...");
+        // Look for common action verbs
+        const actionMatch = lastUserMessage.match(/\b(?:follow up on|send|prepare|draft|schedule|complete|review|call|email|share|update|set up|fix|write|create)\b\s+([A-Za-z0-9\s]+?)(?=\s+by\s+|\s+assign\b|\.\s*|$)/i);
+        if (actionMatch && actionMatch[0]) {
+          finalActionItems = [{ 
+            description: actionMatch[0].trim(), 
+            priority: 'P2', 
+            dueDate: parsedDueDate || undefined, 
+            assignedTo: parsedAssignee 
+          }];
+        }
+      }
+
+      // D. FORCE OVERRIDE: Inject parsed data into whatever items we have
       if (finalActionItems && finalActionItems.length > 0) {
-        const currentYear = new Date().getFullYear();
-        const monthMap: Record<string, string> = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
         finalActionItems = finalActionItems.map(item => {
-          let formattedDate = item.dueDate || null;
           let cleanDescription = item.description;
-          if (formattedDate) {
-            const dateMatch = formattedDate.match(/([A-Za-z]+)\s+(\d{1,2})/);
-            if (dateMatch) {
-              const month = monthMap[dateMatch[1].toLowerCase().substring(0, 3)];
-              const day = dateMatch[2].padStart(2, '0');
-              if (month && day) formattedDate = `${currentYear}-${month}-${day}`;
-            } else if (formattedDate.toLowerCase().includes('next week')) {
-              const d = new Date(); d.setDate(d.getDate() + 7); formattedDate = d.toISOString().split('T')[0];
-            }
-          }
           if (cleanDescription) {
             cleanDescription = cleanDescription
               .replace(/\s*by\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?/i, '')
               .replace(/\s*by\s+(next week|tomorrow|today)/i, '')
+              .replace(/\s*assign(?:ed)?\s+to\s+[A-Za-z]+/i, '')
               .trim();
           }
-          return { ...item, dueDate: formattedDate, description: cleanDescription || item.description };
+          return {
+            ...item,
+            description: cleanDescription || item.description,
+            dueDate: parsedDueDate || item.dueDate || null, // Force override date
+            assignedTo: parsedAssignee // Force override assignee
+          };
         });
       }
           
@@ -324,11 +318,9 @@ let toolChoice: any = 'auto';
       }
 
       // ==========================================
-      // 2. Create Interaction AND Auto-Embed (WITH JS DEDUPE)
+      // 3. SAVE INTERACTION & EMBED
       // ==========================================
       let newInteraction: any = null;
-      
-            // JS Deduplication: Check if a very similar note already exists (ignoring punctuation & casing)
       const { data: existingInteractions } = await supabase.from('interactions').select('notes').eq('account_id', accountId);
       const cleanNewNote = finalInteractionNotes.replace(/[^a-zA-Z0-9 ]/g, '').toLowerCase().replace(/bridgi ai/gi, '').trim();
       
@@ -340,258 +332,221 @@ let toolChoice: any = 'auto';
       if (!isDuplicate) {
         const { data } = await supabase
           .from('interactions')
-          .insert([{
-            account_id: accountId,
-            type: interactionType,
-            notes: finalInteractionNotes,
-          }])
+          .insert([{ account_id: accountId, type: interactionType, notes: finalInteractionNotes }])
           .select('id')
           .single();
         newInteraction = data;
 
-        // Generate the vector embedding
         if (newInteraction) {
           console.log("[Embedding] Generating vector for interaction...");
           const embedding = await generateEmbedding(finalInteractionNotes);
-          
           if (embedding) {
             await supabase.from('interactions').update({ embedding: embedding }).eq('id', newInteraction.id);
-            console.log("[Embedding] Vector saved to database!");
-            // Update the account's last_activity_at timestamp
-            await supabase
-              .from('accounts')
-              .update({ last_activity_at: new Date().toISOString().split('T')[0] })
-              .eq('id', accountId);
+            await supabase.from('accounts').update({ last_activity_at: new Date().toISOString().split('T')[0] }).eq('id', accountId);
           }
         }
       } else {
         console.log("[Write Dedupe] Interaction already exists. Skipping insert.");
       }
 
-      // 3. Create Contacts - WITH DEDUPE & CLEANUP
+      // ==========================================
+      // 4. SAVE CONTACTS
+      // ==========================================
       if (finalContacts && finalContacts.length > 0) {
         const { data: existingContacts } = await supabase.from('contacts').select('name').eq('account_id', accountId);
         const existingNames = new Set(existingContacts?.map((c: any) => c.name.toLowerCase()) || []);
-
         const contactsToInsert = finalContacts
           .filter(c => !existingNames.has(c.name.toLowerCase()))
           .map(c => ({ account_id: accountId, name: c.name, title: c.title || null }));
-
-        if (contactsToInsert.length > 0) {
-          await supabase.from('contacts').insert(contactsToInsert);
-        }
+        if (contactsToInsert.length > 0) await supabase.from('contacts').insert(contactsToInsert);
       }
 
-      // 4. Create Action Items - WITH DEDUPE
+      // ==========================================
+      // 5. SAVE ACTION ITEMS
+      // ==========================================
       if (finalActionItems && finalActionItems.length > 0) {
         const { data: existingActions } = await supabase.from('action_items').select('description').eq('account_id', accountId);
         const existingDescs = new Set(existingActions?.map((a: any) => a.description.toLowerCase().trim()) || []);
-
         const itemsToInsert = finalActionItems
           .filter(a => !existingDescs.has(a.description.toLowerCase().trim()))
-          .map(a => ({ account_id: accountId, description: a.description, priority: a.priority, due_date: a.dueDate || null, status: 'open' }));
-
-        if (itemsToInsert.length > 0) {
-          await supabase.from('action_items').insert(itemsToInsert);
-        }
+          .map(a => ({ account_id: accountId, description: a.description, priority: a.priority, due_date: a.dueDate || null, assigned_to: a.assignedTo || 'Narayan', status: 'open' }));
+        if (itemsToInsert.length > 0) await supabase.from('action_items').insert(itemsToInsert);
       }
 
+      const assignedToName = finalActionItems?.[0]?.assignedTo || 'Narayan';
       return { 
         success: true, 
-        message: `Captured ${finalCompanyName}, ${finalContacts?.map(c => c.name).join(', ') || 'no new contacts'}, follow-up ${finalActionItems?.[0]?.dueDate || 'N/A'}` 
+        message: `Captured ${finalCompanyName}, ${finalContacts?.map(c => c.name).join(', ') || 'no new contacts'}, follow-up ${finalActionItems?.[0]?.dueDate || 'N/A'} (Assigned to ${assignedToName})` 
       };
     },
   };
 
-    const draftCommunicationTool = {
-    description: 'Fetches context to draft a communication (email, whatsapp, linkedin). Use this when the user asks to "draft", "write", or "compose" a message to a specific person.',
+  const draftCommunicationTool = {
+    description: 'Fetches context to draft a communication (email, whatsapp, linkedin).',
     parameters: z.object({
-      contactName: z.string().describe('The name of the person to draft the message to.'),
-      channel: z.string().describe('The communication channel. Must be "email", "whatsapp", or "linkedin".'),
-      objective: z.string().optional().describe('The goal of the message, if specified by the user (e.g., "follow up on proposal").'),
+      contactName: z.string(),
+      channel: z.string(),
+      objective: z.string().optional(),
     }),
     execute: async ({ contactName, channel, objective }: { contactName: string; channel: string; objective?: string }): Promise<DraftToolResult> => {
       let finalContactName = contactName;
       let finalChannel = channel;
       let finalObjective = objective;
-
-      // Extract user message for fallbacks
       const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
 
-      // ==========================================
-      // FALLBACKS: If AI forgets parameters, extract manually
-      // ==========================================
-      
-      // 1. Contact Name Fallback
       if (!finalContactName || finalContactName.trim() === '' || finalContactName === 'undefined') {
-        console.log("[Draft Fallback] AI forgot contact name. Extracting manually...");
-        // Look for "to [Name] at" or "to [Name] about"
         const match = lastUserMessage.match(/\b(?:to|for)\s+([A-Za-z]+(?:\s[A-Za-z]+)*)\s+(?:at|about|regarding)/i);
-        if (match && match[1]) {
-          finalContactName = match[1].trim();
-          console.log(`[Draft Fallback] Extracted contact: ${finalContactName}`);
-        } else {
-          return { found: false, message: "Who would you like to draft this message to? Please specify a contact name." };
-        }
+        if (match && match[1]) finalContactName = match[1].trim();
+        else return { found: false, message: "Who would you like to draft this message to?" };
       }
-
-      // 2. Channel Fallback
       if (!finalChannel || finalChannel.trim() === '' || finalChannel === 'undefined') {
-        console.log("[Draft Fallback] AI forgot channel. Extracting manually...");
         if (/whatsapp/i.test(lastUserMessage)) finalChannel = 'whatsapp';
         else if (/email/i.test(lastUserMessage)) finalChannel = 'email';
         else if (/linkedin/i.test(lastUserMessage)) finalChannel = 'linkedin';
-        else finalChannel = 'email'; // Default to email
+        else finalChannel = 'email'; 
       }
+      if (!finalObjective || finalObjective.trim() === '' || finalObjective === 'undefined') finalObjective = lastUserMessage; 
+      if (finalContactName) finalContactName = finalContactName.replace(/\s+(at|about|regarding|from|for)\s+.*$/i, '').trim();
 
-      // 3. Objective Fallback
-      if (!finalObjective || finalObjective.trim() === '' || finalObjective === 'undefined') {
-        // Just use the whole user message as the objective context
-        finalObjective = lastUserMessage; 
-      }
-            // ==========================================
-      // CLEANUP: Strip "at Company" or "about Topic" from contact name
-      // ==========================================
-      if (finalContactName) {
-        finalContactName = finalContactName.replace(/\s+(at|about|regarding|from|for)\s+.*$/i, '').trim();
-      }
-      console.log(`[Draft Pipeline] Fetching context for contact: ${finalContactName}, channel: ${finalChannel}`);
       const supabase = await createServerClientInstance();
-      
-      // 1. Find the Contact
-      const { data: contact } = await supabase
-        .from('contacts')
-        .select('*, accounts(*)')
-        .ilike('name', `%${finalContactName}%`)
-        .limit(1)
-        .single();
+      const { data: contact } = await supabase.from('contacts').select('*, accounts(*)').ilike('name', `%${finalContactName}%`).limit(1).single();
+      if (!contact) return { found: false, message: `Contact "${finalContactName}" not found.` };
 
-      if (!contact) {
-        return { found: false, message: `Contact "${finalContactName}" not found in the database.` };
-      }
+      const { data: interactions } = await supabase.from('interactions').select('type, notes, date').eq('account_id', contact.account_id).order('date', { ascending: false }).limit(3);
 
-      const accountId = contact.account_id;
-
-      // 2. Get Last 3 Interactions for Context
-      const { data: interactions } = await supabase
-        .from('interactions')
-        .select('type, notes, date')
-        .eq('account_id', accountId)
-        .order('date', { ascending: false })
-        .limit(3);
-
-            // 3. GENERATE THE DRAFT (Sub-Agent Pattern)
       let toneInstruction = "";
       let fewShotExample = "";
-      
       if (finalChannel === 'whatsapp') {
-        toneInstruction = "Write a short, warm, informal WhatsApp message. Use emojis (👋, 🚀, ✅). Get straight to the point. No subject line. End with '- Narayan'.";
-        fewShotExample = `
-        Example WhatsApp:
-        Hi Praveen 👋 Great meeting you today! Just sharing the deck we discussed regarding the COE lab setup 🚀 Let me know your thoughts when you have a moment. ✅ - Narayan`;
+        toneInstruction = "Write a short, warm, informal WhatsApp message. Use emojis. End with '- Narayan'.";
+        fewShotExample = `Hi Praveen 👋 Great meeting you today! Just sharing the deck we discussed 🚀 - Narayan`;
       } else if (finalChannel === 'email') {
-        toneInstruction = "Write a professional, formal, structured email. Start with 'Dear [Name]', end with 'Best regards, Narayan'. Include a subject line.";
-        fewShotExample = `
-        Example Email:
-        Subject: Follow up: BridgeLabz Partnership Discussion
-
-        Dear Praveen,
-
-        It was a pleasure meeting with you and the Kyndryl team today. 
-
-        As discussed, I have attached the proposal for the compliance training module. We believe this aligns perfectly with your upskilling goals for Q3.
-
-        Please let me know if you need any further information.
-
-        Best regards,
-        Narayan`;
+        toneInstruction = "Write a professional, formal email. Start with 'Dear [Name]', end with 'Best regards, Narayan'. Include a subject line.";
+        fewShotExample = `Subject: Follow up\n\nDear Praveen,\n\nIt was a pleasure meeting you.\n\nBest regards,\nNarayan`;
       } else {
         toneInstruction = "Write a professional but conversational LinkedIn message.";
-        fewShotExample = "";
       }
 
       const interactionsContext = (interactions || []).map((int: any) => `- (${int.date}) ${int.notes}`).join('\n');
-
-      console.log(`[Draft Pipeline] Generating ${finalChannel} draft with AI...`);
       const { text: draftText } = await generateText({
         model: google('gemini-2.5-flash'),
         prompt: `You are Bridgi AI, the CRM assistant for Narayan S Mahadevan.
         Objective: ${finalObjective}
         Contact Name: ${contact.name} (${contact.title || 'No title'})
-        Company: ${contact.accounts?.name || 'Unknown'} (Stage: ${contact.accounts?.stage || 'Unknown'})
-        Recent Meeting Notes:\n${interactionsContext}
-
-        ${toneInstruction}
-        ${fewShotExample}
-
-        Write the message now:`
+        Company: ${contact.accounts?.name || 'Unknown'}
+        Recent Meeting Notes:\n${interactionsContext}\n\n${toneInstruction}\n${fewShotExample}\n\nWrite the message now:`
       });
 
-      return {
-        found: true,
-        contact: { name: contact.name, title: contact.title, email: contact.email },
-        account: { name: contact.accounts?.name, stage: contact.accounts?.stage },
-        channel: finalChannel,
-        draftText: draftText // Return the generated draft!
-      };
-
-      // return {
-      //   found: true,
-      //   contact: { name: contact.name, title: contact.title, email: contact.email },
-      //   account: { name: contact.accounts?.name, stage: contact.accounts?.stage },
-      //   recentInteractions: interactions || [],
-      //   channel: finalChannel, // Pass channel back so AI knows how to format
-      //   objective: finalObjective // Pass objective back
-      // };
+      return { found: true, contact: { name: contact.name, title: contact.title, email: contact.email }, account: { name: contact.accounts?.name }, channel: finalChannel, draftText };
     },
   };
 
-    const getDailyDigestTool = {
-    description: 'Fetches the daily digest for the user. Use this ONLY when the user asks "What is on my plate?", "What are my tasks today?", or "Daily digest".',
-    parameters: z.object({}), // No parameters needed from AI
+  const getDailyDigestTool = {
+    description: 'Fetches the daily digest for the user.',
+    parameters: z.object({}),
     execute: async (): Promise<DigestToolResult> => {
-      console.log("[Digest Pipeline] Checking Redis cache...");
       const supabase = await createServerClientInstance();
-      
-      // 1. CHECK REDIS CACHE FIRST
       const cacheKey = `daily-digest-${new Date().toISOString().split('T')[0]}`;
       const cachedData = await redis.get(cacheKey);
-      
-      if (cachedData) {
-        console.log("[Digest Pipeline] Cache HIT! Returning cached digest data.");
-        return cachedData as DigestToolResult;
-      }
+      if (cachedData) return cachedData as DigestToolResult;
 
-      console.log("[Digest Pipeline] Cache MISS. Querying Supabase...");
-      
-      // 2. FETCH FROM SUPABASE
       const today = new Date().toISOString().split('T')[0];
       const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-      // Fetch overdue and due-today action items
-      const { data: overdueActions } = await supabase
-        .from('action_items')
-        .select('description, priority, due_date, status, accounts(name)')
-        .eq('status', 'open')
-        .lte('due_date', today);
+      const { data: overdueActions } = await supabase.from('action_items').select('description, priority, due_date, status, accounts(name)').eq('status', 'open').lte('due_date', today);
+      const { data: staleAccounts } = await supabase.from('accounts').select('name, stage, last_activity_at').lt('last_activity_at', twoWeeksAgo).neq('stage', 'Closed Won');
 
-      // Fetch stale accounts (no activity in 14 days)
-      const { data: staleAccounts } = await supabase
-        .from('accounts')
-        .select('name, stage, last_activity_at')
-        .lt('last_activity_at', twoWeeksAgo)
-        .neq('stage', 'Closed Won'); // Ignore closed accounts
-
-      const digestData = {
-        overdueActions: overdueActions || [],
-        staleAccounts: staleAccounts || []
-      };
-
-      // 3. SAVE TO REDIS CACHE (Expires in 1 hour / 3600 seconds)
+      const digestData = { overdueActions: overdueActions || [], staleAccounts: staleAccounts || [] };
       await redis.set(cacheKey, digestData, { ex: 3600 });
-      console.log("[Digest Pipeline] Data cached for 1 hour.");
-
       return digestData;
+    },
+  };
+
+  const proposeActionTool = {
+    description: 'Use this when the user wants to assign an account, change a stage, or update a record.',
+    parameters: z.object({
+      actionType: z.string(),
+      targetAccount: z.string(),
+      newValue: z.string(),
+    }),
+    execute: async ({ actionType, targetAccount, newValue }: { actionType: string; targetAccount: string; newValue: string }): Promise<ProposeActionToolResult> => {
+      let finalActionType = actionType;
+      let finalTargetAccount = targetAccount;
+      let finalNewValue = newValue;
+      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
+
+      if (!finalActionType || finalActionType === 'undefined') {
+        if (/\bassign\b/i.test(lastUserMessage)) finalActionType = 'assign_spoc';
+        else if (/\bstage\b/i.test(lastUserMessage)) finalActionType = 'update_stage';
+        else finalActionType = 'update';
+      }
+      if (!finalTargetAccount || finalTargetAccount === 'undefined') {
+        const assignMatch = lastUserMessage.match(/(?:assign|update|change)\s+([A-Za-z0-9& ]+?)\s+(?:to|stage)/i);
+        if (assignMatch && assignMatch[1]) finalTargetAccount = assignMatch[1].trim();
+      }
+      if (!finalNewValue || finalNewValue === 'undefined') {
+        const valueMatch = lastUserMessage.match(/(?:to|stage)\s+([A-Za-z0-9& ]+?)(?:\.|!|$)/i);
+        if (valueMatch && valueMatch[1]) finalNewValue = valueMatch[1].trim();
+      }
+
+      let confirmationMessage = "";
+      if (finalActionType === 'assign_spoc') confirmationMessage = `Are you sure you want to assign **${finalTargetAccount}** to **${finalNewValue}**?`;
+      else if (finalActionType === 'update_stage') confirmationMessage = `Are you sure you want to change the stage of **${finalTargetAccount}** to **${finalNewValue}**?`;
+      else confirmationMessage = `Are you sure you want to update **${finalTargetAccount}** to **${finalNewValue}**?`;
+
+      return { actionType: finalActionType, targetAccount: finalTargetAccount, newValue: finalNewValue, confirmationMessage };
+    },
+  };
+
+  const executeActionTool = {
+    description: 'Executes a previously proposed action after the user confirms it.',
+    parameters: z.object({ actionType: z.string(), targetAccount: z.string(), newValue: z.string() }),
+    execute: async ({ actionType, targetAccount, newValue }: { actionType: string; targetAccount: string; newValue: string }): Promise<ExecuteActionToolResult> => {
+      let finalActionType = actionType;
+      let finalTargetAccount = targetAccount;
+      let finalNewValue = newValue;
+      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
+
+      if (!finalActionType || finalActionType === 'undefined' || !finalTargetAccount || finalTargetAccount === 'undefined' || !finalNewValue || finalNewValue === 'undefined') {
+        const match = lastUserMessage.match(/^Confirmed: Execute (.+?) on (.+?) with value (.+?)$/i);
+        if (match && match[1] && match[2] && match[3]) {
+          finalActionType = match[1].trim(); finalTargetAccount = match[2].trim(); finalNewValue = match[3].trim();
+        } else return { success: false, message: "Could not understand the confirmation." };
+      }
+
+      const supabase = await createServerClientInstance();
+      let updatePayload: any = {};
+      if (finalActionType === 'assign_spoc') updatePayload.spoc_name = finalNewValue;
+      else if (finalActionType === 'update_stage') updatePayload.stage = finalNewValue;
+      else updatePayload.spoc_name = finalNewValue;
+
+      const { error } = await supabase.from('accounts').update(updatePayload).ilike('name', `%${finalTargetAccount}%`);
+      if (error) return { success: false, message: `Error: ${error.message}` };
+      
+      let successMsg = `Successfully updated ${finalTargetAccount}.`;
+      if (finalActionType === 'assign_spoc') successMsg += ` Assigned to ${finalNewValue}.`;
+      else if (finalActionType === 'update_stage') successMsg += ` Stage changed to ${finalNewValue}.`;
+
+      return { success: true, message: successMsg };
+    },
+  };
+
+  const getTeamPlateTool = {
+    description: 'Fetches action items assigned to a specific team member.',
+    parameters: z.object({ teamMemberName: z.string().describe('The first name of the team member.') }),
+    execute: async ({ teamMemberName }: { teamMemberName: string }): Promise<TeamPlateToolResult> => {
+      let finalTeamMemberName = teamMemberName;
+      const lastUserMessage = coreMessages.filter((m: any) => m.role === 'user').pop()?.content || '';
+
+      if (!finalTeamMemberName || finalTeamMemberName.trim() === '' || finalTeamMemberName === 'undefined') {
+        const knownMembers = ['piyush', 'jomy', 'puneet', 'manoj', 'narayan', 'anindo', 'vishy'];
+        const foundMember = knownMembers.find(member => lastUserMessage.toLowerCase().includes(member));
+        if (foundMember) finalTeamMemberName = foundMember.charAt(0).toUpperCase() + foundMember.slice(1);
+        else return { error: "Which team member's plate would you like to see?" };
+      }
+
+      const supabase = await createServerClientInstance();
+      const { data: tasks } = await supabase.from('action_items').select('description, priority, due_date, status, accounts(name)').ilike('assigned_to', `%${finalTeamMemberName}%`).eq('status', 'open');
+      return { teamMember: finalTeamMemberName, tasks: tasks || [] };
     },
   };
 
@@ -601,33 +556,19 @@ let toolChoice: any = 'auto';
   const result = await streamText({
     model: google('gemini-2.5-flash'), 
     system: `You are Bridgi AI, the intelligent CRM assistant for Narayan S Mahadevan, Founder & CEO of BridgeLabz.
-    You are warm, professional, and concise.
-    Always address the user as Narayan.
+    You are warm, professional, and concise. Always address the user as Narayan.
        
     RULES FOR INTENT DETECTION:
-    - If the user provides meeting notes, describes an interaction, or says words like "Met", "Attended", "Discussed", or "Follow up", you MUST use the captureMeetingNotes tool. This saves the data to the database.
-    - If the user asks a QUESTION about a company (e.g., "What is the status of X?", "Who are the contacts at Y?", "What are the action items?"), you MUST use the getAccountInfo tool.
-    - Do NOT use getAccountInfo if the user is giving you meeting notes! captureMeetingNotes is for SAVING data, getAccountInfo is for READING data.
+    - If the user provides meeting notes, describes an interaction, or says words like "Met", "Attended", "Discussed", or "Follow up", you MUST use the captureMeetingNotes tool.
+    - If the user asks a QUESTION about a company, you MUST use the getAccountInfo tool.
     
-    - DIGEST RULES: When the getDailyDigest tool returns data, you MUST present it clearly as a Daily Digest.
-    - First, list the Overdue Action Items, grouping them by Priority (P1 first, then P2, then P3). Mention which company the action item belongs to.
-    - Second, list the Stale Accounts (no activity in 14+ days) and suggest the user reach out to them.
-    - If there are no overdue items or stale accounts, congratulate the user on being caught up!
-
     RULES FOR RENDERING:
     - After the tool returns data, you MUST present it clearly.
-    - If the context contains Action Items, list them clearly with their Priority, Status, and Due Date.
-    - NEVER skip the contacts list or action items if they are provided by the tool.
-    - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else. Do not add your own summary or mention names that the tool did not confirm.
-    // - CRITICAL: When the getAccountInfo tool returns data, DO NOT list out the contacts and action items in your text response. Just say a brief sentence like "Here is the information for [Company]:" or "Here are the action items for [Company]:". The UI will render the data card automatically.
-    - SEMANTIC SEARCH: If the context includes "semanticMatches", these are past meeting notes found via semantic similarity (meaning-based search). Prioritize them to answer specific questions about what was discussed in the past, even if the exact keywords aren't in the user's question.
+    - CRITICAL: When the captureMeetingNotes tool returns a success message, you MUST output EXACTLY that message and nothing else.
+    - SEMANTIC SEARCH: Prioritize vector matches to answer specific questions about what was discussed in the past.
     
-    - DRAFTING RULES: When the draftCommunication tool returns data, you MUST draft the message based on the channel.
-    - EMAIL TONE: Professional, formal, structured. Use BridgeLabz voice (warm but corporate). Start with "Dear [Name]", end with "Best regards, Narayan". Include a subject line.
-    - WHATSAPP TONE: Short, warm, informal. Use emojis (👋, 🚀, ✅). Get straight to the point. No subject line. End with "- Narayan".
-    - LINKEDIN TONE: Professional but conversational. Good for connection requests or brief follow-ups.
-    - CONTEXT INTEGRATION: You MUST read the recentInteractions provided. Mention specifics from the last meeting (e.g., "It was great discussing compliance training..."). If an objective was provided, focus the message on that objective.
-    - Do NOT output the draft as a tool result. Output the draft directly as your text response so the user can read it easily.`,
+    - DRAFTING RULES: Output the draft directly as your text response.
+    - ACTION RULES: When the user says "Confirmed: Execute [actionType] on [targetAccount] with value [newValue]", you MUST use the executeAction tool.`,
     
     messages: coreMessages,
     tools: {
@@ -635,11 +576,12 @@ let toolChoice: any = 'auto';
       captureMeetingNotes: captureMeetingNotesTool as any,
       getDailyDigest: getDailyDigestTool as any,
       draftCommunication: draftCommunicationTool as any,
+      proposeAction: proposeActionTool as any,
+      executeAction: executeActionTool as any,
+      getTeamPlate: getTeamPlateTool as any,
     },
     
     toolChoice,
-    // maxSteps: 5,
-    
   });
 
   return result.toUIMessageStreamResponse();

@@ -41,7 +41,11 @@ export default function Chat() {
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            {messages.map((m, messageIndex) => (
+              {messages.map((m, messageIndex) => {
+              // Track which tool results we've already rendered to prevent duplicates
+              const renderedTools = new Set();
+              
+              return (
               <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {/* AI Bubble */}
                 {m.role !== 'user' && <div className="mr-2 mt-1"><BridgiLogo size={32} /></div>}
@@ -77,12 +81,17 @@ export default function Chat() {
                         // If the tool finished                                         
                         if (toolPart.state === 'output-available') {
                           const data = toolPart.output;
-                          const toolName = part.type; 
+                          // Safely extract tool name (removes 'tool-' prefix if it exists)
+                          const toolName = part.type.replace('tool-', ''); 
+                          
+                          // DEDUPLICATION: Skip if we already rendered this tool
+                          if (renderedTools.has(toolPart.toolCallId)) return null;
+                          renderedTools.add(toolPart.toolCallId); 
 
                           // ==========================================
                           // RENDER WRITE CONFIRMATION (Meeting Notes)
                           // ==========================================
-                          if (toolName === 'tool-captureMeetingNotes') {
+                          if (toolName === 'captureMeetingNotes') {
                             if (data.success) {
                               return (
                                 <div key={i} className="mt-2 bg-green-50 border border-green-200 text-green-800 p-3 rounded text-sm flex items-start gap-2">
@@ -101,7 +110,7 @@ export default function Chat() {
                           // ==========================================
                           // RENDER DAILY DIGEST
                           // ==========================================
-                          if (toolName === 'tool-getDailyDigest') {
+                          if (toolName === 'getDailyDigest') {
                             return (
                               <div key={i} className="mt-2 text-sm space-y-3 bg-blue-50 p-4 rounded border border-blue-100">
                                 <div className="font-bold text-[#091C2B] text-base flex items-center gap-2">
@@ -147,7 +156,7 @@ export default function Chat() {
                           // ==========================================
                           // RENDER DRAFT COMMUNICATION (WITH COPY BUTTON)
                           // ==========================================
-                          if (toolName === 'tool-draftCommunication') {
+                          if (toolName === 'draftCommunication') {
                             if (data.found === false) {
                               return <div key={i} className="text-red-500 text-sm mt-1">{data.message}</div>;
                             }
@@ -171,89 +180,191 @@ export default function Chat() {
                           }
 
                           // ==========================================
+                          // RENDER PROPOSE ACTION (Confirmation Card)
+                          // ==========================================
+                          if (toolName === 'proposeAction') {
+                            return (
+                              <div key={i} className="mt-2 bg-yellow-50 border border-yellow-200 p-4 rounded shadow-sm space-y-3">
+                                <div className="font-bold text-yellow-800 text-base">⚠️ Confirm Action</div>
+                                <div className="text-sm text-gray-800">{data.confirmationMessage}</div>
+                                <div className="flex gap-2">
+                                  <button 
+                                    onClick={() => {
+                                      // Trigger the executeAction tool by sending a specific message
+                                      sendMessage({ text: `Confirmed: Execute ${data.actionType} on ${data.targetAccount} with value ${data.newValue}` });
+                                    }}
+                                    className="bg-green-600 text-white text-sm px-3 py-1 rounded hover:bg-green-700"
+                                  >
+                                    ✅ Confirm
+                                  </button>
+                                  <button 
+                                    onClick={() => sendMessage({ text: "Cancelled" })}
+                                    className="bg-red-500 text-white text-sm px-3 py-1 rounded hover:bg-red-600"
+                                  >
+                                    ❌ Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          // ==========================================
+                          // RENDER EXECUTE ACTION (Success Card)
+                          // ==========================================
+                          if (toolName === 'executeAction') {
+                            if (data.success) {
+                              return (
+                                <div key={i} className="mt-2 bg-green-50 border border-green-200 p-3 rounded text-sm flex items-start gap-2">
+                                  <span className="text-lg">✅</span>
+                                  <div>{data.message}</div>
+                                </div>
+                              );
+                            } else {
+                              return <div key={i} className="text-red-500 text-sm mt-1 bg-red-50 p-2 rounded border border-red-200">Error: {data.message}</div>;
+                            }
+                          }
+
+                          // ==========================================
+                          // RENDER TEAM PLATE (PURPLE CARD)
+                          // ==========================================
+                          if (toolName === 'getTeamPlate') {
+                            return (
+                              <div key={i} className="mt-4 border-l-4 border-purple-500 bg-purple-50 p-4 rounded-r-lg shadow-sm">
+                                <div className="flex items-center justify-between mb-3">
+                                  <h3 className="font-bold text-purple-900 text-lg">
+                                    {data.teamMember}&apos;s Plate
+                                  </h3>
+                                  <span className="bg-purple-200 text-purple-800 text-xs font-bold px-2 py-1 rounded-full">
+                                    {data.tasks?.length || 0} Open Tasks
+                                  </span>
+                                </div>
+                                
+                                <div className="space-y-2">
+                                  {data.tasks?.map((task: any, idx: number) => (
+                                    <div key={idx} className="bg-white p-3 rounded border border-purple-100 flex items-start justify-between">
+                                      <div>
+                                        <p className="font-medium text-gray-800">{task.description}</p>
+                                        <p className="text-xs text-gray-500 mt-1">
+                                          Company: {task.accounts?.name || 'N/A'}
+                                        </p>
+                                      </div>
+                                      <div className="text-right ml-4">
+                                        <span className={`text-xs font-bold px-2 py-1 rounded ${
+                                          task.priority === 'P1' ? 'bg-red-100 text-red-700' :
+                                          task.priority === 'P2' ? 'bg-yellow-100 text-yellow-700' :
+                                          'bg-blue-100 text-blue-700'
+                                        }`}>
+                                          {task.priority}
+                                        </span>
+                                        {task.due_date && (
+                                          <p className="text-xs text-gray-500 mt-1">
+                                            Due: {new Date(task.due_date).toLocaleDateString()}
+                                          </p>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                  {data.tasks?.length === 0 && (
+                                    <p className="text-sm text-purple-700 italic">No open tasks. All caught up! 🚀</p>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          // ==========================================
                           // RENDER READ DATA (Account Info)
                           // ==========================================
-                          // Find the user message that immediately precedes THIS AI message
-                          let triggeringUserText = '';
-                          if (messageIndex > 0 && messages[messageIndex - 1].role === 'user') {
-                            triggeringUserText = messages[messageIndex - 1].parts
-                              ?.map((p: any) => p.text)
-                              .join(' ')
-                              .toLowerCase() || '';
-                          }
+                          // Safety check to prevent crash if data.account is missing
+                          if (toolName === 'getAccountInfo') {
+                            if (data.found === false) {
+                              return <div key={i} className="text-red-500 text-sm mt-1">{data.message}</div>;
+                            }
+                            if (!data.account) {
+                              return <div key={i} className="text-red-500 text-sm mt-1">Error: Account data missing.</div>;
+                            }
 
-                          let uiFocus = toolPart.input?.focus || 'full'; 
+                            // Find the user message that immediately precedes THIS AI message
+                            let triggeringUserText = '';
+                            if (messageIndex > 0 && messages[messageIndex - 1].role === 'user') {
+                              triggeringUserText = messages[messageIndex - 1].parts
+                                ?.map((p: any) => p.text)
+                                .join(' ')
+                                .toLowerCase() || '';
+                            }
 
-                          if (triggeringUserText.includes('action item') || triggeringUserText.includes('task') || triggeringUserText.includes('todo') || triggeringUserText.includes('follow up')) {
-                            uiFocus = 'action_items';
-                          } else if (triggeringUserText.includes('contact') || triggeringUserText.includes('person') || triggeringUserText.includes('who')) {
-                            uiFocus = 'contacts';
-                          } else if (triggeringUserText.includes('interaction') || triggeringUserText.includes('meeting') || triggeringUserText.includes('history')) {
-                            uiFocus = 'interactions';
-                          }
+                            let uiFocus = toolPart.input?.focus || 'full'; 
 
-                          if (data.found === false) {
-                            return <div key={i} className="text-red-500 text-sm mt-1">{data.message}</div>;
-                          }
+                            if (triggeringUserText.includes('action item') || triggeringUserText.includes('task') || triggeringUserText.includes('todo') || triggeringUserText.includes('follow up')) {
+                              uiFocus = 'action_items';
+                            } else if (triggeringUserText.includes('contact') || triggeringUserText.includes('person') || triggeringUserText.includes('who')) {
+                              uiFocus = 'contacts';
+                            } else if (triggeringUserText.includes('interaction') || triggeringUserText.includes('meeting') || triggeringUserText.includes('history')) {
+                              uiFocus = 'interactions';
+                            }
 
-                          return (
-                            <div key={i} className="mt-2 text-sm space-y-3 bg-gray-50 p-3 rounded border border-gray-100">
-                              <div className="font-bold text-[#091C2B] text-base">
-                                {data.account.name} 
-                                <span className="font-normal text-gray-500 text-xs ml-2">
-                                  {data.account.type} | {data.account.stage} | {data.account.city}
-                                </span>
+                            return (
+                              <div key={i} className="mt-2 text-sm space-y-3 bg-gray-50 p-3 rounded border border-gray-100">
+                                <div className="font-bold text-[#091C2B] text-base">
+                                  {data.account.name} 
+                                  <span className="font-normal text-gray-500 text-xs ml-2">
+                                    {data.account.type} | {data.account.stage} | {data.account.city}
+                                  </span>
+                                </div>
+                                
+                                {(uiFocus === 'full' || uiFocus === 'contacts') && data.contacts?.length > 0 && (
+                                  <div>
+                                    <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Contacts</div>
+                                    <ul className="mt-1 space-y-1">
+                                      {data.contacts.map((c: any, idx: number) => (
+                                        <li key={idx} className="text-gray-800">
+                                          {c.name} {c.title && <span className="text-gray-500 text-xs">({c.title})</span>}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {(uiFocus === 'contacts' && (!data.contacts || data.contacts.length === 0)) && (
+                                   <div className="text-gray-500 italic">No contacts found for {data.account.name}.</div>
+                                )}
+
+                                {(uiFocus === 'full' || uiFocus === 'interactions') && data.interactions?.length > 0 && (
+                                  <div>
+                                    <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Recent Interactions</div>
+                                    <ul className="mt-1 space-y-1">
+                                      {data.interactions.map((int: any, idx: number) => (
+                                        <li key={idx} className="text-gray-800">
+                                          <span className="text-gray-500 text-xs">({int.date})</span> {int.notes}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {(uiFocus === 'interactions' && (!data.interactions || data.interactions.length === 0)) && (
+                                   <div className="text-gray-500 italic">No recent interactions found for {data.account.name}.</div>
+                                )}
+
+                                {(uiFocus === 'full' || uiFocus === 'action_items') && data.actionItems?.length > 0 && (
+                                  <div>
+                                    <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Action Items</div>
+                                    <ul className="mt-1 space-y-1">
+                                      {data.actionItems.map((a: any, idx: number) => (
+                                        <li key={idx} className="text-gray-800">
+                                          {a.priority} {a.description} <span className="text-gray-500 text-xs">(Status: {a.status}, Due: {a.due_date})</span>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {(uiFocus === 'action_items' && (!data.actionItems || data.actionItems.length === 0)) && (
+                                   <div className="text-gray-500 italic">No pending action items for {data.account.name}.</div>
+                                )}
                               </div>
-                              
-                              {(uiFocus === 'full' || uiFocus === 'contacts') && data.contacts?.length > 0 && (
-                                <div>
-                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Contacts</div>
-                                  <ul className="mt-1 space-y-1">
-                                    {data.contacts.map((c: any, idx: number) => (
-                                      <li key={idx} className="text-gray-800">
-                                        {c.name} {c.title && <span className="text-gray-500 text-xs">({c.title})</span>}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {(uiFocus === 'contacts' && (!data.contacts || data.contacts.length === 0)) && (
-                                 <div className="text-gray-500 italic">No contacts found for {data.account.name}.</div>
-                              )}
-
-                              {(uiFocus === 'full' || uiFocus === 'interactions') && data.interactions?.length > 0 && (
-                                <div>
-                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Recent Interactions</div>
-                                  <ul className="mt-1 space-y-1">
-                                    {data.interactions.map((int: any, idx: number) => (
-                                      <li key={idx} className="text-gray-800">
-                                        <span className="text-gray-500 text-xs">({int.date})</span> {int.notes}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {(uiFocus === 'interactions' && (!data.interactions || data.interactions.length === 0)) && (
-                                 <div className="text-gray-500 italic">No recent interactions found for {data.account.name}.</div>
-                              )}
-
-                              {(uiFocus === 'full' || uiFocus === 'action_items') && data.actionItems?.length > 0 && (
-                                <div>
-                                  <div className="font-semibold text-xs text-gray-600 uppercase tracking-wider">Action Items</div>
-                                  <ul className="mt-1 space-y-1">
-                                    {data.actionItems.map((a: any, idx: number) => (
-                                      <li key={idx} className="text-gray-800">
-                                        {a.priority} {a.description} <span className="text-gray-500 text-xs">(Status: {a.status}, Due: {a.due_date})</span>
-                                      </li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              {(uiFocus === 'action_items' && (!data.actionItems || data.actionItems.length === 0)) && (
-                                 <div className="text-gray-500 italic">No pending action items for {data.account.name}.</div>
-                              )}
-                            </div>
-                          );
+                            );
+                          }
+                          
+                          // Fallback for unknown tools
+                          return null;
                         }
                       }
                       
@@ -262,7 +373,8 @@ export default function Chat() {
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
             {isLoading && messages.at(-1)?.role === 'user' && (
               <div className="flex justify-start">
                 <div className="flex items-center gap-2 bg-gray-100 p-4 rounded-2xl rounded-tl-none border border-gray-200 shadow-sm">
